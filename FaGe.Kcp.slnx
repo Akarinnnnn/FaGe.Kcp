@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/misc/">
+    <File Path=".editorconfig" />
+  </Folder>
+  <Project Path="FaGe.Kcp/FaGe.Kcp.csproj" />
+</Solution>
