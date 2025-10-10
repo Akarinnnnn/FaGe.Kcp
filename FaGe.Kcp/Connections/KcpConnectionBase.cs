@@ -138,6 +138,10 @@ public abstract class KcpConnectionBase : IDisposable
 	/// 取消拥塞控制
 	/// </summary>
 	protected int nocwnd;
+	/// <summary>
+	/// 取消拥塞控制
+	/// </summary>
+	protected bool NoCwnd => nocwnd != 0;
 	// 考虑用EventSource
 	protected int logmask;
 
@@ -146,10 +150,10 @@ public abstract class KcpConnectionBase : IDisposable
 	/// 发送 ack 队列 
 	/// </summary>
 	protected ConcurrentQueue<(uint sn, uint ts)> acklist = new();
-	//private readonly PacketSequence snd_queue;
-	//private readonly PacketSequence rcv_queue;
-	private readonly List<PacketBuffer> snd_buf;
-	private readonly List<PacketBuffer> rcv_queue;
+	private readonly Queue<PacketAndBuffer> snd_queue;
+	private readonly List<PacketAndBuffer> snd_buf;
+	private readonly List<PacketAndBuffer> rcv_queue;
+	private readonly List<PacketAndBuffer> rcv_buf;
 
 	private RentBuffer buffer;
 
@@ -185,9 +189,9 @@ public abstract class KcpConnectionBase : IDisposable
 		buffer = new(ThreeAckPacketBufferSize, OutputTemporaryBufferPool);
 	}
 
+	public event Action? OnDeadConnection = null;
 
-
-	private protected bool IsDisposed { get; private set; }
+	protected bool IsDisposed { get; private set; }
 
 	public uint MTU
 	{
@@ -211,6 +215,17 @@ public abstract class KcpConnectionBase : IDisposable
 	/// </summary>
 	public bool IsUsingStreamTransmission { get; }
 
+	public bool IsInNoDelayMode
+	{
+		get => nodelay != 0;
+		set
+		{
+			if(value)
+				nodelay = 1;
+			else
+				nodelay = 0;
+		}
+	}
 	public KcpConnectionState State { get; private set; }
 
 	private protected abstract ValueTask InvokeOutputCallbackAsync(ReadOnlySequence<byte> buffer, CancellationToken cancellationToken);
@@ -271,12 +286,13 @@ public abstract class KcpConnectionBase : IDisposable
 	/// </summary>
 	public async ValueTask FlushAsync(CancellationToken ct)
 	{
+		// 我们很难在这里使用局部变量来创建临时缓冲区，因为源自stackalloc的内存必须在堆栈上分配，无法在异步点跨越堆栈边界。
+		// 因此，我们使用一个租赁的缓冲区来存储数据，直到调用输出回调。
 		// `current`, store
 		uint tickNow = current;
 
 		int change = 0;
 		int lost = 0;
-		int offset = 0;
 
 		if (!updated)
 			return;
@@ -297,24 +313,27 @@ public abstract class KcpConnectionBase : IDisposable
 		// 估测将使用3个包大小的buffer
 		buffer.EnsureCapacity(ThreeAckPacketBufferSize);
 
-		Memory<byte> encodingAckBuffer = buffer.Memory;
+		Memory<byte> genericEncodingBuffer = buffer.Memory;
+		Memory<byte> currentEncodingBuffer = genericEncodingBuffer;
 
 		while (acklist.TryDequeue(out var ack))
 		{
 			// 检查是否有足够空间写入ACK包
-			int size = encodingAckBuffer.Length - encodingAckBuffer.Length;
+			// 记一下，这是计算已用空间的方式，等会儿要用。原因是忘了返回已编码长度了
+			int size = genericEncodingBuffer.Length - currentEncodingBuffer.Length;
 			if (size + IKCP_OVERHEAD > MTU)
 			{
 				// 已编码的ACK数量超过临时buffer容量，调用输出回调
-				ReadOnlyMemory<byte> encodedBuffer = encodingAckBuffer[..size];
+				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
 				await InvokeOutputCallbackAsync(new(encodedBuffer), ct);
+				currentEncodingBuffer = genericEncodingBuffer;
 			}
 
 			var ackHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { sn = ack.sn, ts = ack.ts });
 
-			var encodeSpan = encodingAckBuffer.Span;
+			var encodeSpan = currentEncodingBuffer.Span;
 			ackHeader.Write(ref encodeSpan);
-			encodingAckBuffer = encodingAckBuffer[(encodingAckBuffer.Length - encodeSpan.Length)..];
+			currentEncodingBuffer = currentEncodingBuffer[(currentEncodingBuffer.Length - encodeSpan.Length)..];
 		}
 
 		// 如果远端窗口大小为0，则探测接收窗口
@@ -350,34 +369,223 @@ public abstract class KcpConnectionBase : IDisposable
 			probe_wait = 0;
 		}
 
-		// 发送探测包（探测远端）
+		// 发送探测包（探测远端窗口大小）
 		if ((probe & AskType.Send) == AskType.Send)
 		{
-			int size = encodingAckBuffer.Length - encodingAckBuffer.Length;
+			int size = genericEncodingBuffer.Length - currentEncodingBuffer.Length;
 			if (size + IKCP_OVERHEAD > MTU)
 			{
-				// 已编码的ACK数量超过临时buffer容量，调用输出回调
-				ReadOnlyMemory<byte> encodedBuffer = encodingAckBuffer[..size];
+				// 已编码的指令数量超过临时buffer容量，调用输出回调
+				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
 				await InvokeOutputCallbackAsync(new(encodedBuffer), ct);
+				currentEncodingBuffer = genericEncodingBuffer;
 			}
 			var probeHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowProbe });
-			var encodeSpan = encodingAckBuffer.Span;
+			var encodeSpan = currentEncodingBuffer.Span;
 			probeHeader.Write(ref encodeSpan);
 		}
 
-		// 发送探测包（通知远端）
+		// 发送探测包（通知远端我们的窗口大小）
 		if ((probe & AskType.Tell) == AskType.Tell)
 		{
-			int size = encodingAckBuffer.Length - encodingAckBuffer.Length;
+			int size = genericEncodingBuffer.Length - currentEncodingBuffer.Length;
 			if (size + IKCP_OVERHEAD > MTU)
 			{
-				// 已编码的ACK数量超过临时buffer容量，调用输出回调
-				ReadOnlyMemory<byte> encodedBuffer = encodingAckBuffer[..size];
+				// 已编码的指令数量超过临时buffer容量，调用输出回调
+				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
 				await InvokeOutputCallbackAsync(new(encodedBuffer), ct);
+				currentEncodingBuffer = genericEncodingBuffer;
 			}
 			var probeHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowSizeTell });
-			var encodeSpan = encodingAckBuffer.Span;
+			var encodeSpan = currentEncodingBuffer.Span;
 			probeHeader.Write(ref encodeSpan);
+		}
+
+		probe = AskType.None;
+
+		uint cwndLocal = Math.Min(snd_wnd, rmt_wnd);
+		if (NoCwnd)
+		{
+			cwndLocal = Math.Min(cwnd, cwndLocal);
+		}
+
+		// 将数据包从发送队列移动到发送缓冲区
+		// 这里没有涉及IO操作，因此可以同步执行
+		while (TimeDiffSigned(snd_nxt, snd_una + cwndLocal) < 0)
+		{
+			if (snd_queue.TryDequeue(out var packet))
+			{
+				var pushHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with
+				{
+					cmd = KcpCommand.Push,
+					// wnd 已经在genericHeader中设置
+					ts = tickNow,
+					sn = snd_nxt,
+					una = rcv_nxt,
+
+				});
+
+				packet.Header = pushHeader;
+
+				packet.resendts = tickNow;
+				packet.rto = rx_rto;
+				packet.fastack = 0;
+				packet.xmit = 0;
+
+				snd_buf.Add(packet);
+				snd_nxt++;
+
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		var resent = fastresend > 0 ? (uint)fastresend : 0xffffffff;
+		var rtomin = IsInNoDelayMode ? (rx_rto >> 3) : 0;
+
+		// flush data segments
+		foreach (var item in snd_buf)
+		{
+			var segment = item;
+			var needsend = false;
+			
+			if (segment.xmit == 0)
+			{
+				//新加入 snd_buf 中, 从未发送过的报文直接发送出去;
+				needsend = true;
+				segment.xmit++;
+				segment.rto = rx_rto;
+				segment.resendts = tickNow + rx_rto + rtomin;
+			}
+			else if (TimeDiffSigned(tickNow, segment.resendts) >= 0)
+			{
+				//发送过的, 但是在 RTO 内未收到 ACK 的报文, 需要重传;
+				needsend = true;
+				segment.xmit++;
+				xmit++;
+				if (IsInNoDelayMode)
+				{
+					segment.rto += Math.Max(segment.rto, rx_rto);
+				}
+				else
+				{
+					var step = nodelay < 2 ? segment.rto : rx_rto;
+					segment.rto += step / 2;
+				}
+
+				segment.resendts = tickNow + segment.rto;
+				lost = 1;
+			}
+			else if (segment.fastack >= resent)
+			{
+				//发送过的, 但是 ACK 失序若干次的报文, 需要执行快速重传.
+				if (segment.xmit <= fastlimit
+					|| fastlimit <= 0)
+				{
+					needsend = true;
+					segment.xmit++;
+					segment.fastack = 0;
+					segment.resendts = tickNow + segment.rto;
+					change++;
+				}
+			}
+
+			if (needsend)
+			{
+				segment.Header = KcpPacketHeader.FromMachine(segment.Header.ValueAnyEndian with
+				{
+					ts = tickNow,
+					wnd = genericHeader.ValueAnyEndian.wnd, // 特殊方式获取方法开始时的wnd值
+					una = rcv_nxt,
+				});
+
+				var need = IKCP_OVERHEAD + segment.Length;
+				// using RentBuffer buffer = new((int)MTU + IKCP_OVERHEAD, ArrayPool<byte>.Shared);
+				int size = genericEncodingBuffer.Length - currentEncodingBuffer.Length;
+				if ( + need > MTU)
+				{
+					await InvokeOutputCallbackAsync(new(genericEncodingBuffer[..size]), ct);
+					currentEncodingBuffer = genericEncodingBuffer;
+				}
+
+				// offset += segment.Encode(buffer.Memory.Span.Slice(offset));
+				var span = currentEncodingBuffer.Span;
+				if (segment.Encode(ref span, out int encodedLength) == OperationStatus.Done)
+				{
+					currentEncodingBuffer = currentEncodingBuffer[encodedLength..];
+				}
+				else
+				{
+					// Log
+				}
+
+				// 用EventSource改写
+				//if (CanLog(KcpLogMask.IKCP_LOG_NEED_SEND))
+				//{
+				//	LogWriteLine($"{segment.ToLogString(true)}", KcpLogMask.IKCP_LOG_NEED_SEND.ToString());
+				//}
+
+				if (segment.xmit >= dead_link)
+				{
+					state = -1;
+
+					// 用EventSource改写
+					//if (CanLog(KcpLogMask.IKCP_LOG_DEAD_LINK))
+					//{
+					//	LogWriteLine($"state = -1; xmit:{segment.xmit} >= dead_link:{dead_link}", KcpLogMask.IKCP_LOG_DEAD_LINK.ToString());
+					//}
+				}
+			}
+
+			int remainingBufferLen = genericEncodingBuffer.Length - currentEncodingBuffer.Length;
+			if (remainingBufferLen > 0)
+			{
+				// 已编码的指令数量超过临时buffer容量，调用输出回调
+				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..remainingBufferLen];
+				await InvokeOutputCallbackAsync(new(encodedBuffer), ct);
+				currentEncodingBuffer = genericEncodingBuffer;
+			}
+
+			#region update ssthresh
+			// update ssthresh 根据丢包情况计算 ssthresh 和 cwnd.
+			if (change != 0)
+			{
+				var inflight = snd_nxt - snd_una;
+				ssthresh = inflight / 2;
+				if (ssthresh < IKCP_THRESH_MIN)
+				{
+					ssthresh = IKCP_THRESH_MIN;
+				}
+
+				cwnd = ssthresh + resent;
+				incr = cwnd * mss;
+			}
+
+			if (lost != 0)
+			{
+				ssthresh = cwnd / 2;
+				if (ssthresh < IKCP_THRESH_MIN)
+				{
+					ssthresh = IKCP_THRESH_MIN;
+				}
+
+				cwnd = 1;
+				incr = mss;
+			}
+
+			if (cwnd < 1)
+			{
+				cwnd = 1;
+				incr = mss;
+			}
+			#endregion
+
+			if (state == -1)
+			{
+				OnDeadConnection?.Invoke();
+			}
 		}
 	}
 
@@ -395,60 +603,10 @@ public abstract class KcpConnectionBase : IDisposable
 
 	internal KcpPacketHeader PrepareSendingPacketHeader(int packetLength)
 	{
+		// TODO
 		throw new NotImplementedException();
 	}
 
-	private struct PacketBuffer(KcpPacketHeader header)
-	{
-		/// <summary>
-		/// Segment No.
-		/// </summary>
-		public uint sn;
-		public readonly Memory<byte> RentBuffer;
-		public KcpPacketHeader Header = header;
-		public int BeginOffset;
-		public int Length;
-
-		public PacketBuffer(Memory<byte> buffer, KcpPacketHeader header) : this(header)
-		{
-			RentBuffer = buffer;
-		}
-
-		public readonly Memory<byte> Memory => RentBuffer.Slice(BeginOffset + IKCP_OVERHEAD, Length);
-		public readonly Memory<byte> RemainingMemory => RentBuffer.Slice(BeginOffset + IKCP_OVERHEAD + Length);
-
-		/// <summary>
-		/// 推进指针
-		/// </summary>
-		/// <param name="count"></param>
-		public void Advance(uint count)
-		{
-			// 不会有2GiB大的包吧？
-			Debug.Assert(count < int.MaxValue);
-			Length += (int)count;
-		}
-
-		public readonly OperationStatus EncodeHeader(Span<byte> span)
-		{
-			if (span.Length < IKCP_OVERHEAD)
-			{
-				return OperationStatus.DestinationTooSmall;
-			}
-
-			var header = Header.ToTransportForm().ValueAnyEndian;
-
-			EncodeGeneric(header.conv, ref span);
-			EncodeGeneric(header.cmd, ref span);
-			EncodeGeneric(header.frg, ref span);
-			EncodeGeneric(header.wnd, ref span);
-			EncodeGeneric(header.ts, ref span);
-			EncodeGeneric(header.sn, ref span);
-			EncodeGeneric(header.una, ref span);
-			EncodeGeneric(header.len, ref span);
-
-			return OperationStatus.Done;
-		}
-	}
 
 	private sealed unsafe class StackBufferOwner(int length, byte* stackBuffer) : MemoryManager<byte>
 	{

@@ -6,6 +6,10 @@ namespace FaGe.Kcp.Connections
 	public enum AskType
 	{
 		/// <summary>
+		/// 
+		/// </summary>
+		None = 0,
+		/// <summary>
 		/// 告知远端窗口大小
 		/// </summary>
 		Tell = KcpConst.IKCP_ASK_TELL,
