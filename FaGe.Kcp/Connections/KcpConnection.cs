@@ -5,7 +5,7 @@ using System.Net.Sockets;
 
 namespace FaGe.Kcp.Connections;
 
-public sealed class KcpConnection(UdpClient udpTransport) : KcpConnectionBase()
+public sealed class KcpConnection(UdpClient udpTransport) : KcpConnectionBase(true)
 {	
 	private readonly UdpClient udpTransport = udpTransport;
 
@@ -17,30 +17,6 @@ public sealed class KcpConnection(UdpClient udpTransport) : KcpConnectionBase()
 	private protected sealed override ValueTask InvokeOutputCallbackAsync(ReadOnlySequence<byte> buffer, CancellationToken cancellationToken)
 	{
 		return UdpOutputAsync(buffer, cancellationToken);
-	}
-
-	/// <summary>
-	/// 尝试更新连接状态
-	/// </summary>
-	/// <returns><see langword="false"/>时，接下来无需继续更新，应停止引用该连接。<see langword="true"/>时，该连接活跃，应继续更新。</returns>
-	public ValueTask<bool> TryUpdateAsync()
-	{
-		if (!IsDisposed && State == KcpConnectionState.Connected)
-		{
-			var dotnetTick64 = Environment.TickCount64;
-			Debug.Assert(dotnetTick64 > 0);
-
-			BaseUpdate((uint)(dotnetTick64 & uint.MaxValue));
-			return PerformIOCore();
-
-			async ValueTask<bool> PerformIOCore()
-			{
-				await PerformIOAsync();
-				return true;
-			}
-		}
-
-		return ValueTask.FromResult(false);
 	}
 
 	private ValueTask UdpOutputAsync(ReadOnlySequence<byte> sequence, CancellationToken cancellationToken)

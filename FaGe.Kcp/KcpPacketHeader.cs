@@ -37,7 +37,10 @@ public readonly record struct KcpPacketHeader(KcpPacketHeaderAnyEndian ValueAnyE
 		}
 	}
 
-	internal void Write(Span<byte> dstSpan)
+	public static KcpPacketHeader FromMachine(KcpPacketHeaderAnyEndian value) => new(value, false);
+	internal static KcpPacketHeader FromTransport(KcpPacketHeaderAnyEndian value) => new(value, true);
+
+	internal void Write(ref Span<byte> dstSpan)
 	{
 		var transportEndianCopy = ToTransportForm().ValueAnyEndian;
 
@@ -48,9 +51,11 @@ public readonly record struct KcpPacketHeader(KcpPacketHeaderAnyEndian ValueAnyE
 #else
 		MemoryMarshal.AsBytes<KcpPacketHeaderAnyEndian>(new(ref transportEndianCopy)).CopyTo(dstSpan);
 #endif
+
+		dstSpan = dstSpan[KcpPacketHeaderAnyEndian.ExpectedSize..];
 	}
 
-	internal static bool TryRead(ReadOnlySequence<byte> data, out KcpPacketHeader header)
+	internal static bool TryRead(ref ReadOnlySequence<byte> data, out KcpPacketHeader header)
 	{
 		header = default;
 		bool result;
@@ -67,6 +72,7 @@ public readonly record struct KcpPacketHeader(KcpPacketHeaderAnyEndian ValueAnyE
 		if (result)
 		{
 			header = new(transportEndian.AdjustEndianness(), false);
+			data = data.Slice(reader.Position);
 		}
 
 		return result;

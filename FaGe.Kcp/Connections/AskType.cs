@@ -2,6 +2,7 @@
 
 namespace FaGe.Kcp.Connections
 {
+	[Flags]
 	public enum AskType
 	{
 		/// <summary>

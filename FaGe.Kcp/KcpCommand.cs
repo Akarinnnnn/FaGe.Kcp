@@ -1,17 +1,18 @@
-﻿namespace FaGe.Kcp;
+﻿using static FaGe.Kcp.KcpConst;
+namespace FaGe.Kcp;
 
 public enum KcpCommand : byte
 {
-	Push = 81,
-	Ack = 82,
-	WindowProbe = 83,
-	WindowSizeResponse = 84
+	Push = IKCP_CMD_PUSH,
+	Ack = IKCP_CMD_ACK,
+	WindowProbe = IKCP_CMD_WASK,
+	WindowSizeTell = IKCP_CMD_WINS
 }
 
 internal enum KcpCommandU4 : uint
 {
-	Push = 81,
-	Ack = 82,
-	WindowProbe = 83,
-	WindowSizeResponse = 84
+	Push = IKCP_CMD_PUSH,
+	Ack = IKCP_CMD_ACK,
+	WindowProbe = IKCP_CMD_WASK,
+	WindowSizeResponse = IKCP_CMD_WINS
 }

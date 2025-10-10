@@ -47,7 +47,7 @@ public struct KcpPacketHeaderAnyEndian
 	[EditorBrowsable(EditorBrowsableState.Advanced)]
 	public KcpCommand cmd { get; set; }
 	[EditorBrowsable(EditorBrowsableState.Advanced)]
-	public byte frag { get; set; }
+	public byte frg { get; set; }
 	[EditorBrowsable(EditorBrowsableState.Advanced)]
 	public ushort wnd { get; set; }
 	[EditorBrowsable(EditorBrowsableState.Advanced)]
