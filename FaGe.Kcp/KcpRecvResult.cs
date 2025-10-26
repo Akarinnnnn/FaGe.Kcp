@@ -17,12 +17,12 @@ public readonly struct KcpRecvResult
 
 	public readonly bool IsFailed => resultValue < 0;
 
-	public readonly KcpRecvFailureReason FailureReason
+	public readonly KcpSendStatus FailureReason
 	{
 		get
 		{
 			if (IsFailed)
-				return (KcpRecvFailureReason)resultValue;
+				return (KcpSendStatus)resultValue;
 
 			throw new InvalidOperationException("接收成功，没有失败");
 		}

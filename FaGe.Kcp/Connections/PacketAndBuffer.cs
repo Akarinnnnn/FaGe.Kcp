@@ -6,15 +6,22 @@ using static FaGe.Kcp.KcpConst;
 namespace FaGe.Kcp.Connections
 {
 	// 我在想struct是不是更好一些，或者class方便修改和传递引用
-	internal struct PacketAndBuffer(KcpPacketHeader header, ArrayPool<byte> bufferSource)
+	internal class PacketAndBuffer(KcpPacketHeader header, ArrayPool<byte> bufferSource)
 		: IDisposable
 	{
 		private RentBuffer rentBuffer = new(0, bufferSource);
 
-		public readonly Memory<byte> RentBuffer => rentBuffer.Memory;
+		public Memory<byte> RentBuffer => rentBuffer.Memory;
 
 		public KcpPacketHeader Header = header; // 不readonly，因为构造后可能需要修改
+
+		/// <summary>
+		/// 开始写入数据的偏移量
+		/// </summary>
 		public int WritingBeginOffset;
+		/// <summary>
+		/// 写入的数据长度
+		/// </summary>
 		public int Length;
 
 		// 这些也是会变的，在FlushAsync里会更新
@@ -27,8 +34,10 @@ namespace FaGe.Kcp.Connections
 		{
 		}
 
-		public readonly Memory<byte> Memory => RentBuffer.Slice(IKCP_OVERHEAD, Length);
-		public readonly Memory<byte> RemainingMemory => RentBuffer[(WritingBeginOffset + IKCP_OVERHEAD + Length)..];
+		public Memory<byte> EncodedMemory => RentBuffer.Slice(IKCP_OVERHEAD, Length);
+		public Memory<byte> RemainingMemory => RentBuffer[(WritingBeginOffset + IKCP_OVERHEAD)..];
+
+		public int Capacity => RentBuffer.Length - IKCP_OVERHEAD;
 
 		public void RentBufferFromPool(int sizeHint)
 		{
@@ -41,14 +50,25 @@ namespace FaGe.Kcp.Connections
 		/// <param name="count"></param>
 		public void Advance(uint count)
 		{
-			// 不会有2GiB大的包吧？
-			Debug.Assert(count < int.MaxValue);
-			Length += (int)count;
+			Debug.Assert(EncodedMemory.Length <= Length + count);
+			Advance(count);
 		}
 
-		public readonly OperationStatus Encode(ref Span<byte> span, out int encodedLength)
+		/// <summary>
+		/// 推进指针
+		/// </summary>
+		/// <param name="count"></param>
+		public void Advance(int count)
 		{
-			if (span.Length < IKCP_OVERHEAD)
+			Debug.Assert(EncodedMemory.Length <= Length + count);
+
+			Length += count;
+			WritingBeginOffset += count;
+		}
+
+		public OperationStatus Encode(ref Span<byte> span, out int encodedLength)
+		{
+			if (span.Length < IKCP_OVERHEAD + Length)
 			{
 				encodedLength = 0;
 				return OperationStatus.DestinationTooSmall;
@@ -58,13 +78,13 @@ namespace FaGe.Kcp.Connections
 
 			span = span[IKCP_OVERHEAD..];
 
-			if (span.Length < Memory.Length)
+			if (span.Length < Length)
 			{
 				encodedLength = IKCP_OVERHEAD;
 				return OperationStatus.DestinationTooSmall;
 			}
 
-			Memory.Span.CopyTo(span[..Length]);
+			EncodedMemory.Span.CopyTo(span[..Length]);
 			encodedLength = Length + IKCP_OVERHEAD;
 
 			span = span[Length..];

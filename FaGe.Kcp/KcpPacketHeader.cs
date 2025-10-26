@@ -4,8 +4,11 @@ using System.Runtime.InteropServices;
 
 namespace FaGe.Kcp;
 
-public readonly record struct KcpPacketHeader(KcpPacketHeaderAnyEndian ValueAnyEndian, bool IsTransportEndian)
+public struct KcpPacketHeader(KcpPacketHeaderAnyEndian anyEndian, bool isTransport)
 {
+	public KcpPacketHeaderAnyEndian ValueAnyEndian = anyEndian;
+	public readonly bool IsTransportEndian = isTransport;
+
 	public KcpPacketHeader ToTransportForm()
 	{
 		if (!IsTransportEndian && BitConverter.IsLittleEndian) // 改大端要改这里

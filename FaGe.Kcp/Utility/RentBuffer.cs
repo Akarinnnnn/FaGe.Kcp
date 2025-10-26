@@ -30,8 +30,10 @@ namespace FaGe.Kcp.Utility
 		{
 			if (Buffer.Length < newSize)
 			{ 
+				var buffer = source.Rent(newSize);
+				Buffer.AsSpan().CopyTo(buffer.AsSpan());
 				Dispose();
-				Buffer = source.Rent(newSize);
+				Buffer = buffer;
 			}
 		}
 	}
