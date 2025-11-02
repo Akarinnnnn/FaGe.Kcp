@@ -2,6 +2,7 @@
 using System.Buffers.Binary;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace FaGe.Kcp;
@@ -65,7 +66,7 @@ public struct KcpPacketHeaderAnyEndian
 	/// <summary>
 	/// 调整端序并产生新实例
 	/// </summary>
-	internal readonly KcpPacketHeaderAnyEndian AdjustEndianness()
+	internal readonly KcpPacketHeaderAnyEndian ReverseEndianness()
 	{
 		var result = this;
 
@@ -78,5 +79,23 @@ public struct KcpPacketHeaderAnyEndian
 		result.sn = BinaryPrimitives.ReverseEndianness(sn);
 
 		return result;
+	}
+
+	internal static KcpPacketHeaderAnyEndian? Decode(ReadOnlySpan<byte> span)
+	{
+		if (span.Length < ExpectedSize)
+			return null;
+
+		return Unsafe.ReadUnaligned<KcpPacketHeaderAnyEndian>(ref MemoryMarshal.GetReference(span));
+	}
+
+	internal static KcpPacketHeader? DecodeToMachineForm(ReadOnlySpan<byte> span)
+	{
+		var headerAnyEndian = Decode(span);
+		if (headerAnyEndian is null)
+			return null;
+
+		var header = new KcpPacketHeader(headerAnyEndian.Value.ReverseEndianness(), false);
+		return header;
 	}
 }

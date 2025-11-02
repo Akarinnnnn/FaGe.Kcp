@@ -6,16 +6,23 @@ namespace FaGe.Kcp;
 
 public struct KcpPacketHeader(KcpPacketHeaderAnyEndian anyEndian, bool isTransport)
 {
+	/// <summary>
+	/// 可修改字段的数据包头部。
+	/// </summary>
+	/// <remarks>
+	/// 可能是机器端序，也可能是传输端序，取决于<see cref="IsTransportEndian"/>。特别注意不要直接对其赋值，以免端序错误。
+	/// </remarks>
 	public KcpPacketHeaderAnyEndian ValueAnyEndian = anyEndian;
 	public readonly bool IsTransportEndian = isTransport;
 
-	public KcpPacketHeader ToTransportForm()
+	public readonly bool IsMachineEndian => !IsTransportEndian;
+
+	public readonly KcpPacketHeader ToTransportForm()
 	{
-		if (!IsTransportEndian && BitConverter.IsLittleEndian) // 改大端要改这里
+		if (!IsTransportEndian && !BitConverter.IsLittleEndian) // 改大端要改这里
 		{
 			var machineEndian = ValueAnyEndian;
-			machineEndian.AdjustEndianness();
-			return new(machineEndian, true);
+			return new(machineEndian.ReverseEndianness(), true);
 		}
 		else
 		{
@@ -23,15 +30,14 @@ public struct KcpPacketHeader(KcpPacketHeaderAnyEndian anyEndian, bool isTranspo
 		}
 	}
 
-	public KcpPacketHeader MachineForm
+	public readonly KcpPacketHeader MachineForm
 	{
 		get
 		{
-			if (IsTransportEndian && BitConverter.IsLittleEndian)
+			if (!IsMachineEndian && !BitConverter.IsLittleEndian) // 改大端要改这里
 			{
 				var transportEndian = ValueAnyEndian;
-				transportEndian.AdjustEndianness();
-				return new(transportEndian, true);
+				return new(transportEndian.ReverseEndianness(), true);
 			}
 			else
 			{
@@ -74,7 +80,7 @@ public struct KcpPacketHeader(KcpPacketHeaderAnyEndian anyEndian, bool isTranspo
 
 		if (result)
 		{
-			header = new(transportEndian.AdjustEndianness(), false);
+			header = new(transportEndian.ReverseEndianness(), false);
 			data = data.Slice(reader.Position);
 		}
 
@@ -92,7 +98,7 @@ public struct KcpPacketHeader(KcpPacketHeaderAnyEndian anyEndian, bool isTranspo
 		if (data.Length >= dstSpan.Length)
 		{
 			data[dstSpan.Length..].CopyTo(dstSpan);
-			header = new(headerAnyEndian.AdjustEndianness(), false);
+			header = new(headerAnyEndian.ReverseEndianness(), false);
 			return true;
 		}
 		else

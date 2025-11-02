@@ -145,10 +145,10 @@ public abstract class KcpConnectionBase : IDisposable
 	/// 发送 ack 队列 
 	/// </summary>
 	protected ConcurrentQueue<(uint sn, uint ts)> acklist = new();
-	private readonly Queue<PacketAndBuffer> snd_queue;
-	private readonly List<PacketAndBuffer> snd_buf;
-	private readonly List<PacketAndBuffer> rcv_queue;
-	private readonly List<PacketAndBuffer> rcv_buf;
+	private readonly Queue<PacketBuffer> snd_queue;
+	private readonly List<PacketBuffer> snd_buf;
+	private readonly List<PacketBuffer> rcv_queue;
+	private readonly List<PacketBuffer> rcv_buf;
 
 	private RentBuffer flushBuffer;
 
@@ -275,27 +275,29 @@ public abstract class KcpConnectionBase : IDisposable
 	/// <returns></returns>
 	private protected abstract ValueTask InvokeOutputCallbackAsync(ReadOnlySequence<byte> buffer, CancellationToken cancellationToken);
 
-	public ValueTask<KcpSendResult> SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct)
+	public KcpSendResult QueueToSender(ReadOnlyMemory<byte> buffer, CancellationToken ct)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
 
 		int sent = 0;
 		Debug.Assert(mss > 0);
 		if (buffer.Length < 0)
-			return ValueTask.FromResult(KcpSendResult.Fail(KcpSendStatus.EmptyBuffer));
+			return KcpSendResult.Fail(KcpSendStatus.EmptyBuffer);
 
 		// append to previous segment in streaming mode (if possible)
 		if (IsStreamMode)
 		{
 			if (snd_queue.Count >= 1)
 			{
-				PacketAndBuffer lastPacket = snd_queue.Last();
+				PacketBuffer lastPacket = snd_queue.Last();
 				if (lastPacket.Length < mss && lastPacket.Capacity >= mss)
 				{
 					if (!buffer.IsEmpty)
 					{
 						int remainingCapacity = lastPacket.Capacity - lastPacket.Length;
 						if (remainingCapacity < mss)
+							// 魔改：由于PacketAndBuffer和C实现的IKCPSEG不同，
+							// 所以扩大容量不是解分配再重新分配，而是直接租赁更大的缓冲区
 							lastPacket.RentBufferFromPool((int)mss);
 
 
@@ -312,7 +314,7 @@ public abstract class KcpConnectionBase : IDisposable
 		}
 
 		if (buffer.IsEmpty)
-			return ValueTask.FromResult(KcpSendResult.Succeed(sent));
+			return KcpSendResult.Succeed(sent);
 
 		int packetCount;
 
@@ -325,14 +327,11 @@ public abstract class KcpConnectionBase : IDisposable
 		{
 			if (IsStreamMode && sent > 0)
 			{
-				return ValueTask.FromResult(KcpSendResult.Succeed(sent));
+				return KcpSendResult.Succeed(sent);
 			}
 			else
 			{
-				new ConvertValueToValueTaskSource()
-				{
-					
-				}
+				return KcpSendResult.Fail(KcpSendStatus.TryAgainLater);
 			}
 		}
 
@@ -342,35 +341,40 @@ public abstract class KcpConnectionBase : IDisposable
 		for (int i = 0; i < packetCount; i++)
 		{
 			int size = buffer.Length > (int)mss ? (int)mss : buffer.Length;
-			PacketAndBuffer newPacket = new(default, ArrayPool<byte>.Shared);
-			newPacket.RentBufferFromPool(size);
+			PacketBuffer newPacket = new(ArrayPool<byte>.Shared, size);
 
 			buffer.Span.Slice(0, size).CopyTo(newPacket.RemainingMemory.Span);
+			newPacket.Advance(size);
 			buffer = buffer[size..];
 
-			newPacket.Header.ValueAnyEndian.frg = IsStreamMode
+			newPacket.HeaderAnyEndian.frg = IsStreamMode
 				? (byte)(packetCount - i - 1)
 				: (byte)0;
 
-			newPacket.Advance(size);
 			snd_queue.Enqueue(newPacket);
 		}
 
 		return KcpSendResult.Succeed(sent);
 	}
 
-	public ValueTask<KcpSequenceSendResult> SendAsync(ReadOnlySequence<byte> buffer)
+	private static readonly Func<KcpSendResult, KcpSequenceSendResult> s_convertSingleSegment = (x) => new(x.SentCount, x.FailReasoon);
+
+	public KcpSequenceSendResult QueueToSender(ReadOnlySequence<byte> buffer, CancellationToken ct)
 	{
+		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+
 		if (buffer.IsSingleSegment)
 		{
-			return Send(buffer.First);
+			var queueResult = QueueToSender(buffer.First, ct);
+			return new (queueResult.SentCount ?? null, queueResult.FailReasoon);
 		}
 		else
 		{
 			long sent = 0;
+
 			foreach (var segment in buffer)
 			{
-				KcpSendResult result = Send(segment);
+				KcpSendResult result = QueueToSender(segment, ct);
 				if (!result.IsSucceed)
 				{
 					return new(sent, result.FailReasoon);
@@ -382,20 +386,206 @@ public abstract class KcpConnectionBase : IDisposable
 		}
 	}
 
-	protected (int? BytesProceed, bool IsFailed) InputFromUnderlyingTransport(ReadOnlyMemory<byte> buffer)
+	// 我觉得接收时不会有ReadOnlySequence传进来的情况，毕竟不是PipeReader读取，而是DatagramSocket接收数据
+	protected KcpInputResult InputFromUnderlyingTransport(ReadOnlyMemory<byte> buffer)
 	{
+		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
 
+		if (buffer.Length < IKCP_OVERHEAD)
+		{
+			return new(-1);
+		}
+
+
+		uint prev_una = snd_una;
+		var offset = 0;
+		int anyAckReceived = 0;// 原flag
+		uint maxack = 0;
+		uint latest_ts = 0;
+
+		while (true)
+		{
+			if (buffer.Length - offset < IKCP_OVERHEAD)
+				break;
+
+			KcpPacketHeader? headerMachineForm = KcpPacketHeaderAnyEndian.DecodeToMachineForm(buffer.Span);
+			if (headerMachineForm is null)
+			{
+				return new(-2);
+			}
+
+			Debug.Assert(headerMachineForm.HasValue && headerMachineForm.Value.IsMachineEndian);
+
+			KcpPacketHeaderAnyEndian header = headerMachineForm.Value.ValueAnyEndian;
+			var dataBuffer = buffer.Slice(offset);
+
+			if (header.conv != conv)
+				return new(-1);
+
+			if (buffer.Length < header.len)
+				return new(-2);
+
+			switch (header.cmd)
+			{
+				case KcpCommand.Ack:
+				case KcpCommand.Push:
+				case KcpCommand.WindowProbe:
+				case KcpCommand.WindowSizeTell:
+					break;
+				default:
+					return new(-3);
+			}
+
+			rmt_wnd = header.wnd;
+			FreePacketsBeingPeerReceived(header.una);
+			ShrinkBuf();
+
+			if (header.cmd == KcpCommand.Ack)
+			{
+				int timeDiff = TimeDiffSigned(current, header.ts);
+				if (timeDiff >= 0)
+					UpdateAck(timeDiff);
+
+				ParseAck(header.sn);
+				ShrinkBuf();
+
+				if (anyAckReceived == 0)
+				{
+					anyAckReceived = 1;
+					maxack = header.sn;
+					latest_ts = header.ts;
+				}
+				else if (TimeDiffSigned(header.sn, maxack) > 0)
+				{
+					maxack = header.sn;
+					latest_ts = header.ts;
+				}
+
+				// TODO ETW Logs
+			}
+			else if (header.cmd == KcpCommand.Push)
+			{
+				// TODO ETW Logs
+
+				if (TimeDiffSigned(header.sn, rcv_nxt + rcv_wnd) < 0)
+				{
+					acklist.Enqueue((header.sn, header.ts));
+
+					if (TimeDiffSigned(header.sn, rcv_nxt) >= 0)
+					{
+						KcpPacketHeaderAnyEndian newHeader = new()
+						{
+							conv = header.conv,
+							cmd = header.cmd,
+							frg = header.frg,
+							wnd = header.wnd,
+							ts = header.ts,
+							sn = header.sn,
+							una = header.una,
+							len = header.len,
+						};
+						PacketBuffer packet = new(ArrayPool<byte>.Shared,
+							KcpPacketHeader.FromMachine(newHeader),
+							(int)header.len);
+
+						dataBuffer.CopyTo(packet.RemainingMemory);
+						packet.Advance(dataBuffer.Length);
+
+						ParseData(packet);
+					}
+				}
+			}
+			else if (header.cmd == KcpCommand.WindowProbe)
+			{
+				probe |= AskType.Tell;
+				// TODO ETW Logs
+			}
+			else if (header.cmd == KcpCommand.WindowSizeTell)
+			{
+				// do nothing, log to ETW
+			}
+			else
+			{
+				return new(-3);
+			}
+
+			offset += (int)header.len;
+		}
+
+		if (anyAckReceived != 0)
+		{
+			ParseFastAck(maxack, latest_ts);
+		}
+
+		if(TimeDiffSigned(snd_una, prev_una) > 0)
+		{
+			if (cwnd < rmt_wnd)
+			{
+				cwnd++;
+				incr = mss;
+			}
+			else
+			{
+				if (incr < mss)
+					incr = mss;
+
+				incr += (mss * mss) / incr * (mss / 16);
+
+				if ((cwnd + 1) * mss <= incr)
+				{
+					cwnd = (incr + mss - 1) / ((mss > 0) ? mss : 1);
+				}
+			}
+
+			if (cwnd > rmt_wnd)
+			{
+				cwnd = rmt_wnd;
+				incr = rmt_wnd * mss;
+			}
+		}
+
+		return new(0);
 	}
 
+	private void ParseFastAck(uint maxack, uint latest_ts)
+	{
+		throw new NotImplementedException();
+	}
+
+	private void ParseData(PacketBuffer packet)
+	{
+		throw new NotImplementedException();
+	}
+
+	private void ParseAck(uint sn)
+	{
+		throw new NotImplementedException();
+	}
+
+	private void UpdateAck(int timeDiff)
+	{
+		throw new NotImplementedException();
+	}
+
+	private void ShrinkBuf()
+	{
+		throw new NotImplementedException();
+	}
+
+	protected void FreePacketsBeingPeerReceived(uint una)
+	{
+		// TODO
+	}
 
 	/// <summary>
-	/// 异步更新时钟，并根据需要执行刷新操作。
+	/// 更新时钟以检测重传状态，并检测是否需要执行刷新操作。
 	/// </summary>
-	/// <param name="timeMillisecNow">现在的时间戳</param>
-	/// <param name="cancellationToken">用于取消更新操作的<see cref="CancellationToken"/></param>
-	/// <returns></returns>
-	public ValueTask UpdateAsync(uint timeMillisecNow, CancellationToken cancellationToken)
+	/// <param name="timeMillisecNow">现在的时间戳，以毫秒为单位。</param>
+	/// <returns>是否需要调用<see cref="FlushAsync(CancellationToken)"/>执行刷新操作。</returns>
+	public bool Update(uint timeMillisecNow)
 	{
+		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+
 		current = timeMillisecNow;
 
 		if (!updated)
@@ -420,18 +610,20 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				ts_flush = current + interval;
 			}
-			// 魔改部分：调用异步刷新
-			return FlushAsync(cancellationToken);
+			
+			return true;
 		}
 		else
 		{
-			return ValueTask.CompletedTask;
+			return false;
 		}
 	}
 
 	// ikcp_check
 	public uint GetWhenShouldUpdate(uint nowMillisec)
 	{
+		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+
 		uint ts_flushLocal = ts_flush;
 		int tm_flush = int.MaxValue;
 		int tm_packet = int.MaxValue;
@@ -457,7 +649,7 @@ public abstract class KcpConnectionBase : IDisposable
 
 		foreach (var segment in snd_buf)
 		{
-			int diff = TimeDiffSigned(segment.resendts, nowMillisec);
+			int diff = TimeDiffSigned(segment.PacketControlFields.resendts, nowMillisec);
 			if (diff <= 0)
 			{
 				return nowMillisec;
@@ -479,10 +671,12 @@ public abstract class KcpConnectionBase : IDisposable
 
 
 	/// <summary>
-	/// 异步执行IO操作，通常在更新时钟之后执行。
+	/// 异步执行IO操作，通常在更新时钟时已经执行。
 	/// </summary>
 	public async ValueTask FlushAsync(CancellationToken ct)
 	{
+		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+
 		// 我们很难在这里使用局部变量来创建临时缓冲区，因为源自stackalloc的内存必须在堆栈上分配，无法在异步点跨越堆栈边界。
 		// 因此，我们使用一个租赁的缓冲区来存储数据，直到调用输出回调。
 		// `current`, store
@@ -621,12 +815,12 @@ public abstract class KcpConnectionBase : IDisposable
 
 				});
 
-				packet.Header = pushHeader;
+				packet.HeaderAnyEndian = pushHeader.ValueAnyEndian;
 
-				packet.resendts = tickNow;
-				packet.rto = rx_rto;
-				packet.fastack = 0;
-				packet.xmit = 0;
+				packet.PacketControlFields.resendts = tickNow;
+				packet.PacketControlFields.rto = rx_rto;
+				packet.PacketControlFields.fastack = 0;
+				packet.PacketControlFields.xmit = 0;
 
 				snd_buf.Add(packet);
 				snd_nxt++;
@@ -647,60 +841,60 @@ public abstract class KcpConnectionBase : IDisposable
 			var segment = item;
 			var needsend = false;
 
-			if (segment.xmit == 0)
+			if (segment.PacketControlFields.xmit == 0)
 			{
 				//新加入 snd_buf 中, 从未发送过的报文直接发送出去;
 				needsend = true;
-				segment.xmit++;
-				segment.rto = rx_rto;
-				segment.resendts = tickNow + rx_rto + rtomin;
+				segment.PacketControlFields.xmit++;
+				segment.PacketControlFields.rto = rx_rto;
+				segment.PacketControlFields.resendts = tickNow + rx_rto + rtomin;
 			}
-			else if (TimeDiffSigned(tickNow, segment.resendts) >= 0)
+			else if (TimeDiffSigned(tickNow, segment.PacketControlFields.resendts) >= 0)
 			{
 				//发送过的, 但是在 RTO 内未收到 ACK 的报文, 需要重传;
 				needsend = true;
-				segment.xmit++;
+				segment.PacketControlFields.xmit++;
 				xmit++;
 				if (IsNoDelayMode)
 				{
-					segment.rto += Math.Max(segment.rto, rx_rto);
+					segment.PacketControlFields.rto += Math.Max(segment.PacketControlFields.rto, rx_rto);
 				}
 				else
 				{
-					var step = nodelay < 2 ? segment.rto : rx_rto;
-					segment.rto += step / 2;
+					var step = nodelay < 2 ? segment.PacketControlFields.rto : rx_rto;
+					segment.PacketControlFields.rto += step / 2;
 				}
 
-				segment.resendts = tickNow + segment.rto;
+				segment.PacketControlFields.resendts = tickNow + segment.PacketControlFields.rto;
 				lost = true;
 			}
-			else if (segment.fastack >= resent)
+			else if (segment.PacketControlFields.fastack >= resent)
 			{
 				//发送过的, 但是 ACK 失序若干次的报文, 需要执行快速重传.
-				if (segment.xmit <= fastlimit
+				if (segment.PacketControlFields.xmit <= fastlimit
 					|| fastlimit <= 0)
 				{
 					needsend = true;
-					segment.xmit++;
-					segment.fastack = 0;
-					segment.resendts = tickNow + segment.rto;
+					segment.PacketControlFields.xmit++;
+					segment.PacketControlFields.fastack = 0;
+					segment.PacketControlFields.resendts = tickNow + segment.PacketControlFields.rto;
 					change++;
 				}
 			}
 
 			if (needsend)
 			{
-				segment.Header = KcpPacketHeader.FromMachine(segment.Header.ValueAnyEndian with
+				segment.HeaderAnyEndian = segment.HeaderAnyEndian with
 				{
 					ts = tickNow,
 					wnd = genericHeader.ValueAnyEndian.wnd, // 特殊方式获取方法开始时的wnd值
 					una = rcv_nxt,
-				});
+				};
 
 				var need = IKCP_OVERHEAD + segment.Length;
 				// using RentBuffer buffer = new((int)MTU + IKCP_OVERHEAD, ArrayPool<byte>.Shared);
 				int size = GetEncodedBufferLength(genericEncodingBuffer, currentEncodingBuffer);
-				if (+need > MTU)
+				if (need > MTU)
 				{
 					await InvokeOutputCallbackAsync(new(genericEncodingBuffer[..size]), ct);
 					currentEncodingBuffer = genericEncodingBuffer;
@@ -723,7 +917,7 @@ public abstract class KcpConnectionBase : IDisposable
 				//	LogWriteLine($"{segment.ToLogString(true)}", KcpLogMask.IKCP_LOG_NEED_SEND.ToString());
 				//}
 
-				if (segment.xmit >= dead_link)
+				if (segment.PacketControlFields.xmit >= dead_link)
 				{
 					state = -1;
 
@@ -798,11 +992,14 @@ public abstract class KcpConnectionBase : IDisposable
 	// ikcp_peeksize
 	public int GetNextReceivedMessageSize()
 	{
+		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+
 		if (rcv_queue.Count == 0)
 			return -1;
 
-		PacketAndBuffer packet = rcv_queue[0];
-		KcpPacketHeaderAnyEndian header = packet.Header.MachineForm.ValueAnyEndian;
+		PacketBuffer packet = rcv_queue[0];
+
+		KcpPacketHeaderAnyEndian header = packet.HeaderAnyEndian;
 		if (header.frg == 0)
 			return (int)header.len;
 
@@ -847,6 +1044,8 @@ public abstract class KcpConnectionBase : IDisposable
 	/// <param name="nc">Specifies whether to disable congestion control. If <see langword="true"/>, congestion control is turned off.</param>
 	public void ConfigureNoDelay(bool nodelay, int interval, int resend, bool nc)
 	{
+		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+
 		if (nodelay)
 		{
 			IsNoDelayMode = nodelay;

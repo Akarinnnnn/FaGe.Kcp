@@ -27,9 +27,9 @@ internal class SendingPacketSequenceWriter : PipeWriter
 		if (ct.IsCancellationRequested)
 			return ValueTask.FromResult(new FlushResult(true, false));
 
-		connection.PrepareSendingPacketHeader(packetLength)
-			.WithLength(packetLength)
-			.Write(headerBuffer.Span);
+		//connection.PrepareSendingPacketHeader(packetLength)
+		//	.WithLength(packetLength)
+		//	.Write(headerBuffer.Span);
 
 		sequence.CommitPacket(packetLength);
 

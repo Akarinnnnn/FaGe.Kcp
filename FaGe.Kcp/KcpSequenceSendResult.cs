@@ -1,6 +1,6 @@
 ﻿using System.Diagnostics.CodeAnalysis;
 
-namespace FaGe.Kcp.Connections;
+namespace FaGe.Kcp;
 
 public readonly record struct KcpSequenceSendResult(long? SentCount, KcpSendStatus FailReasoon)
 {
