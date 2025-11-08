@@ -147,8 +147,8 @@ public abstract class KcpConnectionBase : IDisposable
 	protected ConcurrentQueue<(uint sn, uint ts)> acklist = new();
 	private readonly Queue<PacketBuffer> snd_queue;
 	private readonly List<PacketBuffer> snd_buf;
-	private readonly List<PacketBuffer> rcv_queue;
-	private readonly List<PacketBuffer> rcv_buf;
+	private readonly Queue<PacketBuffer> rcv_queue;
+	private readonly LinkedList<PacketBuffer> rcv_buf;
 
 	private RentBuffer flushBuffer;
 
@@ -554,12 +554,85 @@ public abstract class KcpConnectionBase : IDisposable
 
 	private void ParseData(PacketBuffer packet)
 	{
-		throw new NotImplementedException();
+		uint sn = packet.HeaderAnyEndian.sn;
+
+		if(TimeDiffSigned(sn, rcv_nxt + rcv_wnd) >= 0 ||
+			TimeDiffSigned(sn, rcv_nxt) < 0)
+		{
+			packet.Dispose();
+			return;
+		}
+
+		bool isRepeat = false;
+		LinkedListNode<PacketBuffer>? p;
+		for (p = rcv_buf.Last; p != null; p = p.Previous)
+		{
+			var checkingPacket = p.Value;
+			if (checkingPacket.HeaderAnyEndian.sn == packet.HeaderAnyEndian.sn)
+			{
+				isRepeat = true;
+				break;
+			}
+
+			if (TimeDiffSigned(sn, packet.HeaderAnyEndian.sn) > 0)
+			{
+				break;
+			}
+		}
+
+		if (!isRepeat)
+		{
+			// TODO ETW Log, write header
+
+			if (p == null)
+			{
+				if (packet.HeaderAnyEndian.frg + 1 > rcv_wnd)
+				{
+					AbortConnection();
+					throw new KcpInputException($"sn={packet.HeaderAnyEndian.sn}的分片包" +
+						$"（{packet.HeaderAnyEndian.frg + 1}片），分片长度超过接收窗口，无法继续接收。", 1);
+				}
+
+				rcv_buf.AddFirst(packet);
+			}
+			else
+			{
+				rcv_buf.AddAfter(p, packet);
+			}
+		}
+
+		MoveReceiveBufferToReceiveQueue();
+	}
+
+	private void MoveReceiveBufferToReceiveQueue()
+	{
+		while (rcv_buf.Count > 0)
+		{
+			var first = rcv_buf.First!;
+			var firstPacket = first.Value;
+			var firstSn = firstPacket.HeaderAnyEndian.sn;
+			if (firstSn == rcv_nxt && rcv_queue.Count < RecvWindowSize)
+			{
+				rcv_buf.RemoveFirst();
+				rcv_queue.Enqueue(firstPacket);
+
+				rcv_nxt++;
+			}
+			else
+			{
+				break;
+			}
+		}
+	}
+
+	public virtual void AbortConnection()
+	{
+
 	}
 
 	private void ParseAck(uint sn)
 	{
-		throw new NotImplementedException();
+		if ()
 	}
 
 	private void UpdateAck(int timeDiff)
@@ -997,7 +1070,7 @@ public abstract class KcpConnectionBase : IDisposable
 		if (rcv_queue.Count == 0)
 			return -1;
 
-		PacketBuffer packet = rcv_queue[0];
+		PacketBuffer packet = rcv_queue.Peek();
 
 		KcpPacketHeaderAnyEndian header = packet.HeaderAnyEndian;
 		if (header.frg == 0)
