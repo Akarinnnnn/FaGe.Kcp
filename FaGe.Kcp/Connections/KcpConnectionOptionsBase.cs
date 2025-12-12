@@ -2,5 +2,6 @@
 {
 	public class KcpConnectionOptionsBase
 	{
+		public bool IsPipeMode { get; set; } = false;
 	}
 }

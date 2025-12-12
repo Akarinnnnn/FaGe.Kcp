@@ -14,7 +14,7 @@ public sealed class KcpConnection(UdpClient udpTransport) : KcpConnectionBase(tr
 		
 	}
 
-	private protected sealed override ValueTask InvokeOutputCallbackAsync(ReadOnlySequence<byte> buffer, CancellationToken cancellationToken)
+	private protected sealed override ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
 	{
 		return UdpOutputAsync(buffer, cancellationToken);
 	}
@@ -70,7 +70,7 @@ public sealed class KcpConnection(UdpClient udpTransport) : KcpConnectionBase(tr
 				throw new ArgumentException($"待发送数据的长度超过了上限", nameof(sequence));
 			}
 
-			byte[] tempBufferArray = OutputTemporaryBufferPool.Rent((int)MTU);
+			byte[] tempBufferArray = AckOutputTemporaryBufferPool.Rent((int)MTU);
 			Memory<byte> tempBuffer = tempBufferArray[..(int)MTU];
 
 			try
@@ -87,7 +87,7 @@ public sealed class KcpConnection(UdpClient udpTransport) : KcpConnectionBase(tr
 			}
 			finally
 			{
-				OutputTemporaryBufferPool.Return(tempBufferArray);
+				AckOutputTemporaryBufferPool.Return(tempBufferArray);
 			}
 		}
 	}

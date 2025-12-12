@@ -64,29 +64,6 @@ public struct KcpPacketHeader(KcpPacketHeaderAnyEndian anyEndian, bool isTranspo
 		dstSpan = dstSpan[KcpPacketHeaderAnyEndian.ExpectedSize..];
 	}
 
-	internal static bool TryRead(ref ReadOnlySequence<byte> data, out KcpPacketHeader header)
-	{
-		header = default;
-		bool result;
-
-		SequenceReader<byte> reader = new(data);
-
-		KcpPacketHeaderAnyEndian transportEndian = default;
-		Span<byte> dstSpan = MemoryMarshal.AsBytes(new Span<KcpPacketHeaderAnyEndian>(ref transportEndian));
-
-		Debug.Assert(dstSpan.Length == KcpPacketHeaderAnyEndian.ExpectedSize);
-
-		result = reader.TryCopyTo(dstSpan);
-
-		if (result)
-		{
-			header = new(transportEndian.ReverseEndianness(), false);
-			data = data.Slice(reader.Position);
-		}
-
-		return result;
-	}
-
 	internal static bool TryRead(ReadOnlySpan<byte> data, out KcpPacketHeader header)
 	{
 		header = default;

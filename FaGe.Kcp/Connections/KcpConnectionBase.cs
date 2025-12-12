@@ -3,19 +3,21 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Runtime.CompilerServices;
 using static FaGe.Kcp.KcpConst;
 
 namespace FaGe.Kcp.Connections;
 
-public abstract class KcpConnectionBase : IDisposable
+public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 {
 	/// <summary>
 	/// 控制信号，输出用临时缓冲区
 	/// </summary>
-	protected static readonly ArrayPool<byte> OutputTemporaryBufferPool = ArrayPool<byte>.Create(
+	protected static readonly ArrayPool<byte> AckOutputTemporaryBufferPool = ArrayPool<byte>.Create(
 			(IKCP_MTU_DEF + IKCP_OVERHEAD) * 3,
 			20 /* 脑测值 */);
 #pragma warning disable IDE1006
+	#region KCP内部基元类型状态变量
 	/// <summary>
 	/// 频道号
 	/// </summary>
@@ -139,18 +141,22 @@ public abstract class KcpConnectionBase : IDisposable
 	protected bool NoCwnd { get => nocwnd != 0; set => nocwnd = value ? 1 : 0; }
 	// 考虑用EventSource
 	protected int logmask;
-
+	#endregion
 
 	/// <summary>
 	/// 发送 ack 队列 
 	/// </summary>
-	protected ConcurrentQueue<(uint sn, uint ts)> acklist = new();
-	private readonly Queue<PacketBuffer> snd_queue;
-	private readonly List<PacketBuffer> snd_buf;
+	protected readonly ConcurrentQueue<(uint sn, uint ts)> acklist = new();
+	private readonly Queue<PacketBuffer> snd_queue = new();
+	private readonly LinkedList<PacketBuffer> snd_buf;
 	private readonly Queue<PacketBuffer> rcv_queue;
-	private readonly LinkedList<PacketBuffer> rcv_buf;
+	private readonly LinkedList<PacketBuffer> rcv_buf = new();
 
-	private RentBuffer flushBuffer;
+	// 源自source.dot.net, Pipe.cs的降分配技巧
+	// 现在暂时用不上，哪天我想用了再说
+	private readonly Stack<PacketBuffer> recycledBuffers = new();
+
+	private RentBuffer ackFlushBuffer;
 
 	private bool disposedValue;
 
@@ -161,11 +167,12 @@ public abstract class KcpConnectionBase : IDisposable
 
 #pragma warning restore
 
-	private readonly Pipe sendPipe;
-	private readonly Pipe recvPipe;
+	// Pipe传输模式开的洞
+	private readonly Pipe sendPipe = new();
+	private readonly Pipe receivePipe = new();
 
-	public PipeReader ReceiveReader => recvPipe.Reader;
-	public PipeWriter SendWriter => sendPipe.Writer;
+	protected PipeReader ReceiveReader => receivePipe.Reader;
+	protected PipeWriter SendWriter => sendPipe.Writer;
 
 	protected KcpConnectionBase(
 		uint conversationId,
@@ -182,10 +189,13 @@ public abstract class KcpConnectionBase : IDisposable
 		snd_buf = new();
 		rcv_queue = new();
 
-		flushBuffer = new(ThreeAckPacketBufferSize, OutputTemporaryBufferPool);
+		ackFlushBuffer = new(ThreeAckPacketBufferSize, AckOutputTemporaryBufferPool);
 	}
 
-	public event Action<KcpConnectionBase>? OnDeadConnection = null;
+	public event Action? OnConnectionWasClosed;
+
+	protected void InvokeOnConnectionWasClosed()
+		=> OnConnectionWasClosed?.Invoke();
 
 	protected bool IsDisposed { get; private set; }
 
@@ -202,9 +212,11 @@ public abstract class KcpConnectionBase : IDisposable
 
 			mtu = newmtu;
 			mss = newmss;
-			flushBuffer = new(ThreeAckPacketBufferSize, OutputTemporaryBufferPool);
+			ackFlushBuffer = new(ThreeAckPacketBufferSize, AckOutputTemporaryBufferPool);
 		}
 	}
+
+	public int MaxUserTransferLength => (int)mss;
 
 	public int SendWindowSize
 	{
@@ -265,7 +277,7 @@ public abstract class KcpConnectionBase : IDisposable
 	public KcpConnectionState State { get; private set; }
 
 	/// <summary>
-	/// 内部API，调用输出回调以发送数据。
+	/// 调用输出回调以发送数据。
 	/// </summary>
 	/// <remarks>
 	/// 重写的实现可以固定使用特定的传输机制（如UDP套接字）输出数据，而不是由外部提供输出方案。
@@ -273,7 +285,7 @@ public abstract class KcpConnectionBase : IDisposable
 	/// <param name="buffer"></param>
 	/// <param name="cancellationToken"></param>
 	/// <returns></returns>
-	private protected abstract ValueTask InvokeOutputCallbackAsync(ReadOnlySequence<byte> buffer, CancellationToken cancellationToken);
+	protected abstract ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken);
 
 	public KcpSendResult QueueToSender(ReadOnlyMemory<byte> buffer, CancellationToken ct)
 	{
@@ -290,6 +302,7 @@ public abstract class KcpConnectionBase : IDisposable
 			if (snd_queue.Count >= 1)
 			{
 				PacketBuffer lastPacket = snd_queue.Last();
+				Debug.Assert(lastPacket.IsMachineEndian);
 				if (lastPacket.Length < mss && lastPacket.Capacity >= mss)
 				{
 					if (!buffer.IsEmpty)
@@ -357,36 +370,7 @@ public abstract class KcpConnectionBase : IDisposable
 		return KcpSendResult.Succeed(sent);
 	}
 
-	private static readonly Func<KcpSendResult, KcpSequenceSendResult> s_convertSingleSegment = (x) => new(x.SentCount, x.FailReasoon);
-
-	public KcpSequenceSendResult QueueToSender(ReadOnlySequence<byte> buffer, CancellationToken ct)
-	{
-		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
-
-		if (buffer.IsSingleSegment)
-		{
-			var queueResult = QueueToSender(buffer.First, ct);
-			return new (queueResult.SentCount ?? null, queueResult.FailReasoon);
-		}
-		else
-		{
-			long sent = 0;
-
-			foreach (var segment in buffer)
-			{
-				KcpSendResult result = QueueToSender(segment, ct);
-				if (!result.IsSucceed)
-				{
-					return new(sent, result.FailReasoon);
-				}
-				sent += result.SentCount.Value;
-			}
-
-			return KcpSequenceSendResult.Succeed(sent);
-		}
-	}
-
-	// 我觉得接收时不会有ReadOnlySequence传进来的情况，毕竟不是PipeReader读取，而是DatagramSocket接收数据
+	// 我觉得接收时不会有ReadOnlySequence传进来的情况，毕竟不是PipeReader读取，而是DatagramSocket接收数据。实在有那就让他循环调用。
 	protected KcpInputResult InputFromUnderlyingTransport(ReadOnlyMemory<byte> buffer)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
@@ -408,16 +392,13 @@ public abstract class KcpConnectionBase : IDisposable
 			if (buffer.Length - offset < IKCP_OVERHEAD)
 				break;
 
-			KcpPacketHeader? headerMachineForm = KcpPacketHeaderAnyEndian.DecodeToMachineForm(buffer.Span);
-			if (headerMachineForm is null)
+			if (KcpPacketHeader.TryRead(buffer.Span, out var headerDecoded))
 			{
 				return new(-2);
 			}
 
-			Debug.Assert(headerMachineForm.HasValue && headerMachineForm.Value.IsMachineEndian);
-
-			KcpPacketHeaderAnyEndian header = headerMachineForm.Value.ValueAnyEndian;
-			var dataBuffer = buffer.Slice(offset);
+			KcpPacketHeaderAnyEndian header = headerDecoded.ValueAnyEndian;
+			// var dataBuffer = buffer.Slice(offset); 交给下面
 
 			if (header.conv != conv)
 				return new(-1);
@@ -437,7 +418,7 @@ public abstract class KcpConnectionBase : IDisposable
 			}
 
 			rmt_wnd = header.wnd;
-			FreePacketsBeingPeerReceived(header.una);
+			FreePacketsBeingPeerReceived(header.sn, header.ts);
 			ShrinkBuf();
 
 			if (header.cmd == KcpCommand.Ack)
@@ -473,24 +454,10 @@ public abstract class KcpConnectionBase : IDisposable
 
 					if (TimeDiffSigned(header.sn, rcv_nxt) >= 0)
 					{
-						KcpPacketHeaderAnyEndian newHeader = new()
-						{
-							conv = header.conv,
-							cmd = header.cmd,
-							frg = header.frg,
-							wnd = header.wnd,
-							ts = header.ts,
-							sn = header.sn,
-							una = header.una,
-							len = header.len,
-						};
-						PacketBuffer packet = new(ArrayPool<byte>.Shared,
-							KcpPacketHeader.FromMachine(newHeader),
-							(int)header.len);
+						int packetLength = IKCP_OVERHEAD + (int)header.len;
+						var packet = PacketBuffer.FromNetwork(buffer[..packetLength], ArrayPool<byte>.Shared);
 
-						dataBuffer.CopyTo(packet.RemainingMemory);
-						packet.Advance(dataBuffer.Length);
-
+						buffer = buffer[packetLength..];
 						ParseData(packet);
 					}
 				}
@@ -517,7 +484,7 @@ public abstract class KcpConnectionBase : IDisposable
 			ParseFastAck(maxack, latest_ts);
 		}
 
-		if(TimeDiffSigned(snd_una, prev_una) > 0)
+		if (TimeDiffSigned(snd_una, prev_una) > 0)
 		{
 			if (cwnd < rmt_wnd)
 			{
@@ -556,7 +523,7 @@ public abstract class KcpConnectionBase : IDisposable
 	{
 		uint sn = packet.HeaderAnyEndian.sn;
 
-		if(TimeDiffSigned(sn, rcv_nxt + rcv_wnd) >= 0 ||
+		if (TimeDiffSigned(sn, rcv_nxt + rcv_wnd) >= 0 ||
 			TimeDiffSigned(sn, rcv_nxt) < 0)
 		{
 			packet.Dispose();
@@ -588,7 +555,8 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				if (packet.HeaderAnyEndian.frg + 1 > rcv_wnd)
 				{
-					AbortConnection();
+					InvokeOnConnectionWasClosed();
+					// 这里不要dispose，让上层处理
 					throw new KcpInputException($"sn={packet.HeaderAnyEndian.sn}的分片包" +
 						$"（{packet.HeaderAnyEndian.frg + 1}片），分片长度超过接收窗口，无法继续接收。", 1);
 				}
@@ -625,36 +593,100 @@ public abstract class KcpConnectionBase : IDisposable
 		}
 	}
 
-	public virtual void AbortConnection()
-	{
-
-	}
 
 	private void ParseAck(uint sn)
 	{
-		if ()
+		if (TimeDiffSigned(sn, snd_una) < 0 ||
+			TimeDiffSigned(sn, snd_nxt) >= 0)
+		{
+			return;
+		}
+
+		for (var p = snd_buf.First; p != null; p = p.Next)
+		{
+			var packet = p.Value;
+			if (sn == packet.HeaderAnyEndian.sn)
+			{
+				snd_buf.Remove(p);
+				packet.Dispose();
+				break;
+			}
+
+			if (TimeDiffSigned(sn, packet.HeaderAnyEndian.sn) < 0)
+			{
+				break;
+			}
+		}
 	}
 
-	private void UpdateAck(int timeDiff)
+	private void UpdateAck(int rtt)
 	{
-		throw new NotImplementedException();
+		if (rx_srtt == 0)
+		{
+			rx_srtt = (uint)rtt;
+			rx_rttval = (uint)rtt / 2;
+		}
+		else
+		{
+			int delta = (int)((uint)rtt - rx_srtt);
+
+			if (delta < 0)
+			{
+				delta = -delta;
+			}
+
+			rx_rttval = (3 * rx_rttval + (uint)delta) / 4;
+			rx_srtt = (uint)((7 * rx_srtt + rtt) / 8);
+
+			if (rx_srtt < 1)
+			{
+				rx_srtt = 1;
+			}
+		}
+
+		var rto = rx_srtt + Math.Max(interval, 4 * rx_rttval);
+
+		rx_rto = Bound(rx_minrto, rto, IKCP_RTO_MAX);
 	}
+
+	private static uint Bound(uint lower, uint middle, uint upper)
+		=> Math.Min(Math.Max(lower, middle), upper);
 
 	private void ShrinkBuf()
 	{
-		throw new NotImplementedException();
+		snd_una = snd_buf.Count > 0 ? snd_buf.First!.Value.HeaderAnyEndian.sn : snd_nxt;
 	}
 
-	protected void FreePacketsBeingPeerReceived(uint una)
+	protected void FreePacketsBeingPeerReceived(uint sn, uint ts)
 	{
-		// TODO
+		if (TimeDiffSigned(sn, snd_una) < 0 || TimeDiffSigned(sn, snd_nxt) >= 0)
+			return;
+
+		// p = p.Next看着吓人但是目前版本(NET10)能行
+		for (var p = snd_buf.First; p != null; p = p.Next)
+		{
+			PacketBuffer packet = p.Value;
+			if (TimeDiffSigned(sn, packet.HeaderAnyEndian.sn) < 0)
+			{
+				break;
+			}
+			else if (sn != packet.HeaderAnyEndian.sn)
+			{
+				// # ifndef IKCP_FASTACK_CONSERVE
+				//				seg->fastack++;
+				// #else
+				if (TimeDiffSigned(ts, packet.HeaderAnyEndian.ts) >= 0)
+					packet.PacketControlFields.fastack++;
+				// #endif
+			}
+		}
 	}
 
 	/// <summary>
-	/// 更新时钟以检测重传状态，并检测是否需要执行刷新操作。
+	/// 更新时钟以检测传输状态，并检测是否需要执行刷新操作，适合进阶场景。
 	/// </summary>
 	/// <param name="timeMillisecNow">现在的时间戳，以毫秒为单位。</param>
-	/// <returns>是否需要调用<see cref="FlushAsync(CancellationToken)"/>执行刷新操作。</returns>
+	/// <returns>是否需要立即调用<see cref="FlushAsync(CancellationToken)"/>执行刷新操作。</returns>
 	public bool Update(uint timeMillisecNow)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
@@ -683,13 +715,25 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				ts_flush = current + interval;
 			}
-			
+
 			return true;
 		}
 		else
 		{
 			return false;
 		}
+	}
+
+	/// <summary>
+	/// 更新时钟以检测传输状态，并自动按需执行刷新操作。
+	/// </summary>
+ 	/// <param name="timeMillisecNow">现在的时间戳，以毫秒为单位。</param>
+	public ValueTask UpdateAsync(uint timeMillisecNow, CancellationToken ct)
+	{
+		if (!Update(timeMillisecNow))
+			return ValueTask.CompletedTask;
+		else
+			return FlushAsync(ct);
 	}
 
 	// ikcp_check
@@ -775,9 +819,9 @@ public abstract class KcpConnectionBase : IDisposable
 
 		// 发送ACK包
 		// 估测将使用3个包大小的buffer
-		flushBuffer.EnsureCapacity(ThreeAckPacketBufferSize);
+		ackFlushBuffer.EnsureCapacity(ThreeAckPacketBufferSize);
 
-		Memory<byte> genericEncodingBuffer = flushBuffer.Memory;
+		Memory<byte> genericEncodingBuffer = ackFlushBuffer.Memory;
 		Memory<byte> currentEncodingBuffer = genericEncodingBuffer;
 
 		while (acklist.TryDequeue(out var ack))
@@ -788,7 +832,7 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				// 已编码的ACK数量超过临时buffer容量，调用输出回调
 				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
-				await InvokeOutputCallbackAsync(new(encodedBuffer), ct);
+				await InvokeOutputCallbackAsync(encodedBuffer, ct);
 				currentEncodingBuffer = genericEncodingBuffer;
 			}
 
@@ -840,7 +884,7 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				// 已编码的指令数量超过临时buffer容量，调用输出回调
 				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
-				await InvokeOutputCallbackAsync(new(encodedBuffer), ct);
+				await InvokeOutputCallbackAsync(encodedBuffer, ct);
 				currentEncodingBuffer = genericEncodingBuffer;
 			}
 			var probeHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowProbe });
@@ -856,7 +900,7 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				// 已编码的指令数量超过临时buffer容量，调用输出回调
 				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
-				await InvokeOutputCallbackAsync(new(encodedBuffer), ct);
+				await InvokeOutputCallbackAsync(encodedBuffer, ct);
 				currentEncodingBuffer = genericEncodingBuffer;
 			}
 			var probeHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowSizeTell });
@@ -895,7 +939,7 @@ public abstract class KcpConnectionBase : IDisposable
 				packet.PacketControlFields.fastack = 0;
 				packet.PacketControlFields.xmit = 0;
 
-				snd_buf.Add(packet);
+				snd_buf.AddLast(packet);
 				snd_nxt++;
 
 			}
@@ -969,7 +1013,7 @@ public abstract class KcpConnectionBase : IDisposable
 				int size = GetEncodedBufferLength(genericEncodingBuffer, currentEncodingBuffer);
 				if (need > MTU)
 				{
-					await InvokeOutputCallbackAsync(new(genericEncodingBuffer[..size]), ct);
+					await InvokeOutputCallbackAsync(currentEncodingBuffer, ct);
 					currentEncodingBuffer = genericEncodingBuffer;
 				}
 
@@ -1008,7 +1052,7 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				// 已编码的指令数量超过临时buffer容量，调用输出回调
 				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..encodedBufferLen];
-				await InvokeOutputCallbackAsync(new(encodedBuffer), ct);
+				await InvokeOutputCallbackAsync(encodedBuffer, ct);
 				currentEncodingBuffer = genericEncodingBuffer;
 			}
 
@@ -1048,7 +1092,7 @@ public abstract class KcpConnectionBase : IDisposable
 
 			if (state == -1)
 			{
-				OnDeadConnection?.Invoke(this);
+				InvokeOnConnectionWasClosed();
 			}
 		}
 
@@ -1112,8 +1156,8 @@ public abstract class KcpConnectionBase : IDisposable
 	/// </remarks>
 	/// <param name="nodelay">Specifies whether to enable no-delay mode. If <see langword="true"/>, the protocol operates with reduced minimum
 	/// retransmission timeout for lower latency.</param>
-	/// <param name="interval">The update interval, in milliseconds, for internal protocol processing. Default value is 100ms.</param>
-	/// <param name="resend">Specifies whether to enable fast resend.</param>
+	/// <param name="interval">此参数控制刷新（flush）间隔，以毫秒为单位，用于内部协议处理的周期性刷新操作。注意，刷新操作实际由用户执行。</param>
+	/// <param name="resend">Specifies max amount of fast resendable packet.</param>
 	/// <param name="nc">Specifies whether to disable congestion control. If <see langword="true"/>, congestion control is turned off.</param>
 	public void ConfigureNoDelay(bool nodelay, int interval, int resend, bool nc)
 	{
@@ -1149,30 +1193,71 @@ public abstract class KcpConnectionBase : IDisposable
 		NoCwnd = nc;
 	}
 
-
-
 	protected virtual void Dispose(bool disposing)
 	{
 		if (!disposedValue)
 		{
 			if (disposing)
 			{
-				// TODO: 释放托管状态(托管对象)
-				flushBuffer.Dispose();
+				DisposeBuffers();
+
+				sendPipe.Reset();
+				receivePipe.Reset();
 			}
 
-			// TODO: 释放未托管的资源(未托管的对象)并重写终结器
-			// TODO: 将大型字段设置为 null
 			disposedValue = true;
 		}
 	}
 
-	// // TODO: 仅当“Dispose(bool disposing)”拥有用于释放未托管资源的代码时才替代终结器
-	// ~KcpConnectionBase()
-	// {
-	//     // 不要更改此代码。请将清理代码放入“Dispose(bool disposing)”方法中
-	//     Dispose(disposing: false);
-	// }
+	public ValueTask DisposeAsync()
+	{
+		disposedValue = true;
+		DisposeBuffers();
+
+		ValueTask completeSend = sendPipe.Reader.CompleteAsync();
+		ValueTask completeReceive = receivePipe.Writer.CompleteAsync();
+		ValueTaskAwaiter awaiter = completeSend.GetAwaiter();
+		if (awaiter.IsCompleted)
+		{
+			completeSend = ValueTask.CompletedTask;
+			awaiter.GetResult();
+			awaiter = completeReceive.GetAwaiter();
+			if (awaiter.IsCompleted)
+			{
+				awaiter.GetResult();
+				return ValueTask.CompletedTask;
+			}
+		}
+		
+		return DisposeAsyncAwaited(completeSend, completeReceive);
+
+		static async ValueTask DisposeAsyncAwaited(ValueTask completeSend, ValueTask completeReceive)
+		{
+			await completeSend;
+			await completeReceive;
+		}
+	}
+
+	private void DisposeBuffers()
+	{
+		ackFlushBuffer.Dispose();
+		foreach (var packet in snd_buf)
+			packet.Dispose();
+		foreach (var packet in snd_queue)
+			packet.Dispose();
+		foreach (var packet in rcv_buf)
+			packet.Dispose();
+		foreach (var packet in rcv_queue)
+			packet.Dispose();
+		foreach (var packet in recycledBuffers)
+			packet.Dispose();
+
+		snd_buf.Clear();
+		snd_queue.Clear();
+		rcv_buf.Clear();
+		rcv_queue.Clear();
+		recycledBuffers.Clear();
+	}
 
 	public void Dispose()
 	{

@@ -12,16 +12,16 @@ public readonly record struct KcpSequenceSendResult(long? SentCount, KcpSendStat
 	
 }
 
-public readonly record struct KcpSendResult(int? SentCount, KcpSendStatus FailReasoon)
+public readonly record struct KcpSendResult(int? SentCount, KcpSendStatus FailReason)
 {
 	[MemberNotNullWhen(true, nameof(SentCount))]
-	public bool IsSucceed => FailReasoon == KcpSendStatus.Succeed;
+	public bool IsSucceed => FailReason == KcpSendStatus.Succeed;
 
 	public static KcpSendResult Succeed(int sentCount) => new(sentCount, KcpSendStatus.Succeed);
 	public static KcpSendResult Fail(KcpSendStatus reason) => new(null, reason);
 
 	public static implicit operator KcpSequenceSendResult(KcpSendResult value)
 	{
-		return new(value.SentCount ?? null, value.FailReasoon);
+		return new(value.SentCount ?? null, value.FailReason);
 	}
 }

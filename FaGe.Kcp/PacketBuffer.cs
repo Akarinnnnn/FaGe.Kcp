@@ -105,7 +105,7 @@ namespace FaGe.Kcp
 				return OperationStatus.DestinationTooSmall;
 			}
 
-			ConvertHeaderToMachineEndian();
+			ConvertHeaderToNetworkEndian();
 
 			PacketMemory.Span.CopyTo(span[..Length]);
 			encodedLength = Length + IKCP_OVERHEAD;
@@ -113,6 +113,20 @@ namespace FaGe.Kcp
 			span = span[(Length + IKCP_OVERHEAD)..];
 
 			return OperationStatus.Done;
+		}
+
+		public static PacketBuffer FromNetwork(ReadOnlyMemory<byte> packetBuffer, ArrayPool<byte> bufferSource)
+		{
+			PacketBuffer result = new(bufferSource, packetBuffer.Length);
+			
+			if (result.rentBuffer.Buffer.Length < packetBuffer.Length)
+				result.rentBuffer.EnsureCapacity(packetBuffer.Length);
+
+			packetBuffer.CopyTo(result.RentBuffer);
+			result.Length = packetBuffer.Length - IKCP_OVERHEAD;
+
+			result.HeaderAnyEndian.ReverseEndianness();
+			return result;
 		}
 
 		public void Dispose()
