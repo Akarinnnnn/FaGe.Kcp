@@ -1,6 +1,8 @@
 ﻿using FaGe.Kcp.Connections.Features;
 using Microsoft.AspNetCore.Http.Features;
+using System.Buffers;
 using System.Collections;
+using System.Net.Sockets;
 
 namespace Kcp.Kestrel.Connections;
 
@@ -25,6 +27,8 @@ public partial class KcpConnectionContext : IFeatureCollection, IKcpDefaultsFeat
 	public bool IsReadOnly => features.IsReadOnly;
 	public int Revision => features.Revision;
 
+	public Func<ReadOnlySequence<byte>, KcpConnectionContext, CancellationToken, ValueTask> OutputCallbackAsync { get; set; }
+
 	public TFeature? Get<TFeature>()
 	{
 		return features.Get<TFeature>();
@@ -39,5 +43,15 @@ public partial class KcpConnectionContext : IFeatureCollection, IKcpDefaultsFeat
 	IEnumerator IEnumerable.GetEnumerator()
 	{
 		return ((IEnumerable<KeyValuePair<Type, object>>)this).GetEnumerator();
+	}
+
+	public void InitializeUdpOutput(UdpClient udpClient)
+	{
+		throw new NotImplementedException();
+	}
+
+	public void Update(uint kcpTickNow)
+	{
+		throw new NotImplementedException();
 	}
 }

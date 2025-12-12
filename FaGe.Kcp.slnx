@@ -2,5 +2,6 @@
   <Folder Name="/misc/">
     <File Path=".editorconfig" />
   </Folder>
+  <Project Path="FaGe.Kcp.ClientDemo/FaGe.Kcp.ClientDemo.csproj" Id="0f2141a8-d9d6-4bb5-bbee-8118795aee11" />
   <Project Path="FaGe.Kcp/FaGe.Kcp.csproj" />
 </Solution>

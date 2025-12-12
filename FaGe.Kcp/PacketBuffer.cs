@@ -8,11 +8,11 @@ using static FaGe.Kcp.KcpConst;
 namespace FaGe.Kcp
 {
 	// 用class，需要引用语义。原因是保持所有同源buffer的一致性，避免struct拷贝带来的不一致
-	internal class PacketBuffer(ArrayPool<byte> bufferSource, int expectedCapacity)
+	internal class PacketBuffer(ArrayPool<byte> bufferSource, int expectedCapacity, bool isMachineEndian)
 				: IDisposable
 	{
 		private RentBuffer rentBuffer = new(expectedCapacity + IKCP_OVERHEAD, bufferSource);
-		public bool IsMachineEndian { get; private set; }
+		public bool IsMachineEndian { get; private set; } = isMachineEndian;
 
 
 		// 不返回ref readonly，因为构造后可能需要修改
@@ -22,7 +22,7 @@ namespace FaGe.Kcp
 		public KcpPacketHeader Header => new(HeaderAnyEndian, IsMachineEndian);
 
 		public PacketBuffer(ArrayPool<byte> bufferSource, KcpPacketHeader header = default, int expectedCapacity = 0)
-			: this(bufferSource, expectedCapacity)
+			: this(bufferSource, expectedCapacity, header.IsMachineEndian)
 		{
 			HeaderAnyEndian = header.ValueAnyEndian;
 			IsMachineEndian = header.IsMachineEndian;
@@ -107,7 +107,7 @@ namespace FaGe.Kcp
 
 			ConvertHeaderToNetworkEndian();
 
-			PacketMemory.Span.CopyTo(span[..Length]);
+			PacketMemory.Span.CopyTo(span[..(Length + IKCP_OVERHEAD)]);
 			encodedLength = Length + IKCP_OVERHEAD;
 
 			span = span[(Length + IKCP_OVERHEAD)..];
@@ -117,7 +117,7 @@ namespace FaGe.Kcp
 
 		public static PacketBuffer FromNetwork(ReadOnlyMemory<byte> packetBuffer, ArrayPool<byte> bufferSource)
 		{
-			PacketBuffer result = new(bufferSource, packetBuffer.Length);
+			PacketBuffer result = new(bufferSource, packetBuffer.Length, false);
 			
 			if (result.rentBuffer.Buffer.Length < packetBuffer.Length)
 				result.rentBuffer.EnsureCapacity(packetBuffer.Length);

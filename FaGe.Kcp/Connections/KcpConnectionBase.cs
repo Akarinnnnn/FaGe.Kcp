@@ -163,7 +163,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	[Obsolete]
 	private int stream => IsStreamMode ? 1 : 0;
 
-	private int ThreeAckPacketBufferSize => (int)(3 * (MTU + IKCP_OVERHEAD));
+	private int ThreeMtuPacketBufferSize => (int)(3 * (MTU + IKCP_OVERHEAD));
 
 #pragma warning restore
 
@@ -189,7 +189,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		snd_buf = new();
 		rcv_queue = new();
 
-		ackFlushBuffer = new(ThreeAckPacketBufferSize, AckOutputTemporaryBufferPool);
+		ackFlushBuffer = new(ThreeMtuPacketBufferSize, AckOutputTemporaryBufferPool);
 	}
 
 	public event Action? OnConnectionWasClosed;
@@ -212,7 +212,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 			mtu = newmtu;
 			mss = newmss;
-			ackFlushBuffer = new(ThreeAckPacketBufferSize, AckOutputTemporaryBufferPool);
+			ackFlushBuffer = new(ThreeMtuPacketBufferSize, AckOutputTemporaryBufferPool);
 		}
 	}
 
@@ -353,8 +353,11 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 		for (int i = 0; i < packetCount; i++)
 		{
+			if (ct.IsCancellationRequested)
+				return KcpSendResult.Succeed(sent);
+
 			int size = buffer.Length > (int)mss ? (int)mss : buffer.Length;
-			PacketBuffer newPacket = new(ArrayPool<byte>.Shared, size);
+			PacketBuffer newPacket = new(ArrayPool<byte>.Shared, size, true);
 
 			buffer.Span.Slice(0, size).CopyTo(newPacket.RemainingMemory.Span);
 			newPacket.Advance(size);
@@ -363,6 +366,8 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			newPacket.HeaderAnyEndian.frg = IsStreamMode
 				? (byte)(packetCount - i - 1)
 				: (byte)0;
+
+			sent += size;
 
 			snd_queue.Enqueue(newPacket);
 		}
@@ -819,7 +824,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 		// 发送ACK包
 		// 估测将使用3个包大小的buffer
-		ackFlushBuffer.EnsureCapacity(ThreeAckPacketBufferSize);
+		ackFlushBuffer.EnsureCapacity(ThreeMtuPacketBufferSize);
 
 		Memory<byte> genericEncodingBuffer = ackFlushBuffer.Memory;
 		Memory<byte> currentEncodingBuffer = genericEncodingBuffer;
@@ -1050,8 +1055,8 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			int encodedBufferLen = GetEncodedBufferLength(genericEncodingBuffer, currentEncodingBuffer);
 			if (encodedBufferLen > 0)
 			{
-				// 已编码的指令数量超过临时buffer容量，调用输出回调
-				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..encodedBufferLen];
+				// 已编码的包数量超过临时buffer容量，调用输出回调
+				ReadOnlyMemory<byte> encodedBuffer = genericEncodingBuffer[..encodedBufferLen];
 				await InvokeOutputCallbackAsync(encodedBuffer, ct);
 				currentEncodingBuffer = genericEncodingBuffer;
 			}

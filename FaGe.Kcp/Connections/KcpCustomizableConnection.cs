@@ -5,13 +5,17 @@ namespace FaGe.Kcp.Connections;
 
 public sealed class KcpCustomizableConnection : KcpConnectionBase
 {
-	public Func<ReadOnlySequence<byte>, KcpCustomizableConnection, CancellationToken, ValueTask>? OutputCallbackAsync { get; set; }
+	public KcpCustomizableConnection(uint conversationId) : base(conversationId)
+	{
+	}
 
-	private protected sealed override ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+	public Func<ReadOnlyMemory<byte>, KcpCustomizableConnection, CancellationToken, ValueTask>? OutputCallbackAsync { get; set; }
+
+	protected sealed override ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
 	{
 		Debug.Assert(OutputCallbackAsync != null);
 		return OutputCallbackAsync(buffer, this, cancellationToken);
 	}
 
-	public void ExternalUpdate(uint timeTickNow) => BaseUpdate(timeTickNow);
+	public void ExternalUpdate(uint timeTickNow) => Update(timeTickNow);
 }
