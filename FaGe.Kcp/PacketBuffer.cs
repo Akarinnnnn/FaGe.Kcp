@@ -54,7 +54,7 @@ namespace FaGe.Kcp
 
 		public void ConvertHeaderToMachineEndian()
 		{
-			if (!IsMachineEndian)
+			if (!IsMachineEndian && !BitConverter.IsLittleEndian) // 改大端要改这里
 			{
 				HeaderAnyEndian = HeaderAnyEndian.ReverseEndianness();
 				IsMachineEndian = true;
@@ -63,7 +63,7 @@ namespace FaGe.Kcp
 
 		public void ConvertHeaderToNetworkEndian()
 		{
-			if (IsMachineEndian)
+			if (IsMachineEndian && !BitConverter.IsLittleEndian) // 改大端要改这里
 			{
 				HeaderAnyEndian = HeaderAnyEndian.ReverseEndianness();
 				IsMachineEndian = false;
