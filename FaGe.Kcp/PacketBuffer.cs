@@ -12,13 +12,16 @@ namespace FaGe.Kcp
 				: IDisposable
 	{
 		private RentBuffer rentBuffer = new(expectedCapacity + IKCP_OVERHEAD, bufferSource);
+		
 		public bool IsMachineEndian { get; private set; } = isMachineEndian;
 
-
 		// 不返回ref readonly，因为构造后可能需要修改
-		public ref KcpPacketHeaderAnyEndian HeaderAnyEndian =>
+		internal ref KcpPacketHeaderAnyEndian HeaderAnyEndian =>
 				ref Unsafe.As<byte, KcpPacketHeaderAnyEndian>(ref HeaderMemory.Span.GetPinnableReference()); 
 
+		/// <summary>
+		/// 
+		/// </summary>
 		public KcpPacketHeader Header => new(HeaderAnyEndian, IsMachineEndian);
 
 		public PacketBuffer(ArrayPool<byte> bufferSource, KcpPacketHeader header = default, int expectedCapacity = 0)
@@ -39,15 +42,29 @@ namespace FaGe.Kcp
 
 		private Memory<byte> RentBuffer => rentBuffer.Memory;
 
-
+		/// <summary>
+		/// 控制字
+		/// </summary>
 		public PacketControlFields PacketControlFields = default;
 
+		/// <summary>
+		/// KCP包头内容
+		/// </summary>
 		public Memory<byte> HeaderMemory => RentBuffer[..IKCP_OVERHEAD];
 
-		public Memory<byte> EncodedMemory => RentBuffer.Slice(IKCP_OVERHEAD, Length);
+		/// <summary>
+		/// 包中payload内容
+		/// </summary>
+		public Memory<byte> PayloadMemory => RentBuffer.Slice(IKCP_OVERHEAD, Length);
 
+		/// <summary>
+		/// Buffer剩余空间视图
+		/// </summary>
 		public Memory<byte> RemainingMemory => RentBuffer[(WritingBeginOffset + IKCP_OVERHEAD)..];
 
+		/// <summary>
+		/// 全包视图
+		/// </summary>
 		public Memory<byte> PacketMemory => RentBuffer[..(IKCP_OVERHEAD + Length)];
 
 		public int Capacity => RentBuffer.Length - IKCP_OVERHEAD;
@@ -81,7 +98,7 @@ namespace FaGe.Kcp
 		/// <param name="count"></param>
 		public void Advance(uint count)
 		{
-			Debug.Assert(EncodedMemory.Length <= Length + count);
+			Debug.Assert(PayloadMemory.Length <= Length + count);
 			Advance(count);
 		}
 
@@ -91,7 +108,7 @@ namespace FaGe.Kcp
 		/// <param name="count"></param>
 		public void Advance(int count)
 		{
-			Debug.Assert(EncodedMemory.Length <= Length + count);
+			Debug.Assert(PayloadMemory.Length <= Length + count);
 
 			Length += count;
 			WritingBeginOffset += count;
@@ -119,7 +136,7 @@ namespace FaGe.Kcp
 		{
 			PacketBuffer result = new(bufferSource, packetBuffer.Length, false);
 			
-			if (result.rentBuffer.Buffer.Length < packetBuffer.Length)
+			if (result.rentBuffer.Buffer!.Length < packetBuffer.Length)
 				result.rentBuffer.EnsureCapacity(packetBuffer.Length);
 
 			packetBuffer.CopyTo(result.RentBuffer);

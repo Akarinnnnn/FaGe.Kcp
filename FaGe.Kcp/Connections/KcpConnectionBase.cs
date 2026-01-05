@@ -1,4 +1,5 @@
-﻿using FaGe.Kcp.Utility;
+﻿using DanmakuR.Protocol.Buffer;
+using FaGe.Kcp.Utility;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -171,8 +172,14 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	private readonly Pipe sendPipe = new();
 	private readonly Pipe receivePipe = new();
 
-	protected PipeReader ReceiveReader => receivePipe.Reader;
-	protected PipeWriter SendWriter => sendPipe.Writer;
+	//protected PipeReader ReceiveReader => receivePipe.Reader;
+	//protected PipeWriter SendWriter => sendPipe.Writer;
+
+	#region 内部异步支持
+	// 并发不安全
+	private TaskCompletionSource currentAsyncRead = new();
+	private TaskCompletionSource currentAsyncSend = new();
+	#endregion
 
 	protected KcpConnectionBase(
 		uint conversationId,
@@ -286,10 +293,16 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	/// <param name="cancellationToken"></param>
 	/// <returns></returns>
 	protected abstract ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken);
-
+	
+	/// <summary>
+	/// 
+	/// </summary>
+	/// <param name="buffer"></param>
+	/// <param name="ct"></param>
+	/// <returns></returns>
 	public KcpSendResult QueueToSender(ReadOnlyMemory<byte> buffer, CancellationToken ct)
 	{
-		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+		ObjectDisposedException.ThrowIf(IsDisposed, this);
 
 		int sent = 0;
 		Debug.Assert(mss > 0);
@@ -375,6 +388,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		return KcpSendResult.Succeed(sent);
 	}
 
+	#region 从底层传输输入数据
 	// 我觉得接收时不会有ReadOnlySequence传进来的情况，毕竟不是PipeReader读取，而是DatagramSocket接收数据。实在有那就让他循环调用。
 	protected KcpInputResult InputFromUnderlyingTransport(ReadOnlyMemory<byte> buffer)
 	{
@@ -519,9 +533,31 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		return new(0);
 	}
 
-	private void ParseFastAck(uint maxack, uint latest_ts)
+	private void ParseFastAck(uint sn, uint latest_ts)
 	{
-		throw new NotImplementedException();
+		if (TimeDiffSigned(sn, snd_una) < 0 || TimeDiffSigned(sn, snd_nxt) >= 0)
+		{
+			return;
+		}
+
+		foreach (var packet in snd_buf)
+		{
+			if (TimeDiffSigned(sn, packet.HeaderAnyEndian.sn) < 0)
+			{
+				break;
+			}
+			else if (sn != packet.HeaderAnyEndian.sn)
+			{
+#if !IKCP_FASTACK_CONSERVE
+				packet.PacketControlFields.fastack++;
+#else
+                    if (TimeDiffSigned(ts, seg.ts) >= 0)
+                    {
+                        packet.PacketControlFields.fastack++;
+                    }
+#endif
+			}
+		}
 	}
 
 	private void ParseData(PacketBuffer packet)
@@ -597,7 +633,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			}
 		}
 	}
-
 
 	private void ParseAck(uint sn)
 	{
@@ -677,15 +712,115 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			}
 			else if (sn != packet.HeaderAnyEndian.sn)
 			{
-				// # ifndef IKCP_FASTACK_CONSERVE
-				//				seg->fastack++;
-				// #else
+#if !IKCP_FASTACK_CONSERVE
+				packet.PacketControlFields.fastack++;
+#else
 				if (TimeDiffSigned(ts, packet.HeaderAnyEndian.ts) >= 0)
 					packet.PacketControlFields.fastack++;
-				// #endif
+#endif
 			}
 		}
 	}
+	#endregion
+
+	#region 传递数据到上层
+	public KcpApplicationPacket TryReadPacket(CancellationToken cancellationToken)
+	{
+		if (rcv_queue.Count == 0)
+			return default; // 使source为null，确保不会调用Advance
+
+		ReadOnlySequence<byte> result = GetFirstPacketMemory(out int fragmentCount);
+
+		if (fragmentCount == -1)
+			return default;
+
+		ReadResult readResult = new(result, IsDisposed, cancellationToken.IsCancellationRequested);
+
+		return new KcpApplicationPacket(readResult, this, fragmentCount);
+	}
+
+	// 我有预感，这个method会变得难以理解
+	private ReadOnlySequence<byte> GetFirstPacketMemory(out int fragmentCount)
+	{
+		SimpleSegment? segHead = null;
+		SimpleSegment? segTail = null;
+		PacketBuffer packet = rcv_queue.Peek();
+		Debug.Assert(packet.IsMachineEndian, "此包未经处理，直接传入了上层？");
+		byte frg = packet.HeaderAnyEndian.frg;
+		if (frg == 0)
+		{
+			fragmentCount = 0;
+			return new(packet.PayloadMemory);
+		}
+		else
+		{
+			// 这就是选择Queue<T>的下场
+			if (rcv_queue.Count < frg + 1)
+			{
+				fragmentCount = -1;
+				return default;
+			}
+			else
+			{
+				// 第一分片转换为头节点
+				segHead = segTail = new SimpleSegment(packet.PayloadMemory, 0);
+				rcv_queue.Dequeue();
+
+				// 转换后续分片。
+				// frg 0 1 ...x   eos
+				// pkt 1 2 ...x+1 eos
+				// idx 0 1 ...x   eos
+				for (fragmentCount = 1; fragmentCount <= frg; fragmentCount++)
+				{
+					packet = rcv_queue.Dequeue();
+					Debug.Assert(packet.IsMachineEndian, "此包未经处理，直接传入了上层？");
+					segTail = segTail.SetNext(packet.PayloadMemory);
+				}
+
+				return new ReadOnlySequence<byte>(segHead, 0, segTail, segTail.Memory.Length);
+			}
+		}
+	}
+
+	internal void AdvanceFragment(int packetFragmentsCount)
+	{
+		for (int i = 0; i < packetFragmentsCount; i++)
+		{
+			if (rcv_queue.Count == 0)
+			{
+				Debug.Assert(rcv_queue.Count != 0, "AdvanceFragment called more than available fragments. Thread race or internal bugs?");
+				var ex = new InvalidOperationException("[FaGe.Kcp] 内部错误，需要释放的分片数量超过已接收的分片数量。" + Environment.NewLine + 
+					$"\t可能的原因是：多线程竞争同一连接，或FaGe.Kcp内部存在bug。请查看{nameof(Exception)}.{nameof(Exception.Data)}获取更多信息");
+
+				ex.Data["ConnectionId"] = conv;
+				ex.Data["Instance"] = this;
+				ex.Data["CurrentThreadId"] = Environment.CurrentManagedThreadId;
+
+				throw ex;
+			}
+			var packet = rcv_queue.Dequeue();
+			packet.Dispose();
+		}
+	}
+	#endregion
+
+	#region 异步收发API
+
+	public virtual ValueTask<KcpSendResult> SendAsync(
+		ReadOnlyMemory<byte> buffer,
+		CancellationToken cancellationToken)
+	{
+		
+	}
+
+	public virtual ValueTask<KcpRecvResult> ReceiveAsync(
+		Memory<byte> buffer,
+		CancellationToken cancellationToken)
+	{
+		
+	}
+
+	#endregion
 
 	/// <summary>
 	/// 更新时钟以检测传输状态，并检测是否需要执行刷新操作，适合进阶场景。
@@ -732,7 +867,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	/// <summary>
 	/// 更新时钟以检测传输状态，并自动按需执行刷新操作。
 	/// </summary>
- 	/// <param name="timeMillisecNow">现在的时间戳，以毫秒为单位。</param>
+	/// <param name="timeMillisecNow">现在的时间戳，以毫秒为单位。</param>
 	public ValueTask UpdateAsync(uint timeMillisecNow, CancellationToken ct)
 	{
 		if (!Update(timeMillisecNow))
@@ -1233,7 +1368,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				return ValueTask.CompletedTask;
 			}
 		}
-		
+
 		return DisposeAsyncAwaited(completeSend, completeReceive);
 
 		static async ValueTask DisposeAsyncAwaited(ValueTask completeSend, ValueTask completeReceive)

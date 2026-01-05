@@ -5,29 +5,44 @@ using System.Text;
 
 namespace FaGe.Kcp.Utility
 {
-	internal struct RentBuffer : IDisposable
+	public struct RentBuffer(int size, ArrayPool<byte> source) : IDisposable
 	{
-		private readonly ArrayPool<byte> source;
+		private readonly ArrayPool<byte> source = source;
 
-		public RentBuffer(int size, ArrayPool<byte> source)
+		public byte[]? Buffer { get; private set; } = source.Rent(size);
+
+		public readonly Span<byte> Span
 		{
-			Buffer = source.Rent(size);
-			this.source = source;
+			get
+			{
+				ObjectDisposedException.ThrowIf(Buffer == null, typeof(RentBuffer));
+
+				return Buffer.AsSpan();
+			}
 		}
-		
-		public byte[] Buffer { get; private set; }
 
-		public Span<byte> Span => Buffer.AsSpan();
+		public readonly Memory<byte> Memory
+		{
+			get
+			{
+				ObjectDisposedException.ThrowIf(Buffer == null, typeof(RentBuffer));
 
-		public Memory<byte> Memory => Buffer.AsMemory();
-
+				return Buffer.AsMemory();
+			}
+		}
 		public void Dispose()
 		{
+			if (Buffer == null)
+				return;
+
 			source.Return(Buffer);
+			Buffer = null;
 		}
 
 		public void EnsureCapacity(int newSize)
 		{
+			ObjectDisposedException.ThrowIf(Buffer == null, typeof(RentBuffer));
+
 			if (Buffer.Length < newSize)
 			{ 
 				var buffer = source.Rent(newSize);
