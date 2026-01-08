@@ -13,6 +13,21 @@ namespace FaGe.Kcp
 	{
 		private RentBuffer rentBuffer = new(expectedCapacity + IKCP_OVERHEAD, bufferSource);
 		
+		internal TaskCompletionSource? PacketFinished { get; private set; }
+
+		internal CancellationTokenSource? DisposeCts { get; private set; }
+
+		internal void SetPacketFinished(TaskCompletionSource tcs, CancellationToken ct)
+		{
+			PacketFinished = tcs;
+			DisposeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+			DisposeCts.Token.Register(() =>
+			{
+				tcs.TrySetCanceled(DisposeCts.Token);
+				Dispose();
+			});
+		}
+
 		public bool IsMachineEndian { get; private set; } = isMachineEndian;
 
 		// 不返回ref readonly，因为构造后可能需要修改
@@ -142,7 +157,7 @@ namespace FaGe.Kcp
 			packetBuffer.CopyTo(result.RentBuffer);
 			result.Length = packetBuffer.Length - IKCP_OVERHEAD;
 
-			result.HeaderAnyEndian.ReverseEndianness();
+			result.ConvertHeaderToMachineEndian();
 			return result;
 		}
 

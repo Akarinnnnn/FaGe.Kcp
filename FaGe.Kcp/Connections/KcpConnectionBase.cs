@@ -1,10 +1,13 @@
 ﻿using DanmakuR.Protocol.Buffer;
 using FaGe.Kcp.Utility;
+using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using static FaGe.Kcp.KcpConst;
 
 namespace FaGe.Kcp.Connections;
@@ -169,17 +172,13 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 #pragma warning restore
 
 	// Pipe传输模式开的洞
-	private readonly Pipe sendPipe = new();
-	private readonly Pipe receivePipe = new();
+	//private readonly Pipe sendPipe = new();
+	//private readonly Pipe receivePipe = new();
 
 	//protected PipeReader ReceiveReader => receivePipe.Reader;
 	//protected PipeWriter SendWriter => sendPipe.Writer;
 
-	#region 内部异步支持
-	// 并发不安全
-	private TaskCompletionSource currentAsyncRead = new();
-	private TaskCompletionSource currentAsyncSend = new();
-	#endregion
+	TaskCompletionSource? pendingReceiveTaskSource = null;
 
 	protected KcpConnectionBase(
 		uint conversationId,
@@ -191,8 +190,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		rmt_wnd = IKCP_WND_RCV;
 		MTU = IKCP_MTU_DEF;
 
-		// snd_queue = Channel.CreateUnbounded<PacketBuffer>(sendQueueOptions);
-		// rcv_queue = Channel.CreateUnbounded<PacketBuffer>(receiveQueueOptions);
 		snd_buf = new();
 		rcv_queue = new();
 
@@ -293,17 +290,18 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	/// <param name="cancellationToken"></param>
 	/// <returns></returns>
 	protected abstract ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken);
-	
+
 	/// <summary>
 	/// 
 	/// </summary>
 	/// <param name="buffer"></param>
+	/// <param name="source"></param>
 	/// <param name="ct"></param>
 	/// <returns></returns>
-	public KcpSendResult QueueToSender(ReadOnlyMemory<byte> buffer, CancellationToken ct)
+	public KcpSendResult QueueToSenderWithAsyncSource(ReadOnlyMemory<byte> buffer, TaskCompletionSource? source, CancellationToken ct)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, this);
-
+		PacketBuffer? packetOfLastFragment = null;
 		int sent = 0;
 		Debug.Assert(mss > 0);
 		if (buffer.Length < 0)
@@ -315,6 +313,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			if (snd_queue.Count >= 1)
 			{
 				PacketBuffer lastPacket = snd_queue.Last();
+				packetOfLastFragment = lastPacket;
 				Debug.Assert(lastPacket.IsMachineEndian);
 				if (lastPacket.Length < mss && lastPacket.Capacity >= mss)
 				{
@@ -325,7 +324,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 							// 魔改：由于PacketAndBuffer和C实现的IKCPSEG不同，
 							// 所以扩大容量不是解分配再重新分配，而是直接租赁更大的缓冲区
 							lastPacket.RentBufferFromPool((int)mss);
-
 
 						int copyLen = Math.Min(lastPacket.Capacity - lastPacket.Length,
 							buffer.Length);
@@ -340,7 +338,17 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		}
 
 		if (buffer.IsEmpty)
-			return KcpSendResult.Succeed(sent);
+		{
+			if (source is not null)
+			{
+				packetOfLastFragment?.SetPacketFinished(source, ct);
+				return KcpSendResult.Succeed(sent, source);
+			}
+			else
+			{
+				return KcpSendResult.Succeed(sent);
+			}
+		}
 
 		int packetCount;
 
@@ -353,7 +361,15 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		{
 			if (IsStreamMode && sent > 0)
 			{
-				return KcpSendResult.Succeed(sent);
+				if (source is not null)
+				{
+					packetOfLastFragment?.SetPacketFinished(source, ct);
+					return KcpSendResult.Succeed(sent, source);
+				}
+				else
+				{
+					return KcpSendResult.Succeed(sent);
+				}
 			}
 			else
 			{
@@ -367,25 +383,44 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		for (int i = 0; i < packetCount; i++)
 		{
 			if (ct.IsCancellationRequested)
-				return KcpSendResult.Succeed(sent);
+			{
+				if (source is not null)
+				{
+					source.SetCanceled(ct);
+					return KcpSendResult.Succeed(sent, source);
+				}
+				else
+				{
+					return KcpSendResult.Succeed(sent);
+				}
+			}
 
 			int size = buffer.Length > (int)mss ? (int)mss : buffer.Length;
 			PacketBuffer newPacket = new(ArrayPool<byte>.Shared, size, true);
 
-			buffer.Span.Slice(0, size).CopyTo(newPacket.RemainingMemory.Span);
+			buffer.Span[..size].CopyTo(newPacket.RemainingMemory.Span);
 			newPacket.Advance(size);
 			buffer = buffer[size..];
 
 			newPacket.HeaderAnyEndian.frg = IsStreamMode
-				? (byte)(packetCount - i - 1)
+				? (byte)(packetCount - i - 1) // 6packets idx: [5, 4, 3, 2, 1, 0] 
 				: (byte)0;
 
 			sent += size;
 
+			packetOfLastFragment = newPacket;
 			snd_queue.Enqueue(newPacket);
 		}
 
-		return KcpSendResult.Succeed(sent);
+		if (source is not null)
+		{
+			packetOfLastFragment?.SetPacketFinished(source, ct);
+			return KcpSendResult.Succeed(sent, source);
+		}
+		else
+		{
+			return KcpSendResult.Succeed(sent);
+		}
 	}
 
 	#region 从底层传输输入数据
@@ -437,7 +472,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			}
 
 			rmt_wnd = header.wnd;
-			FreePacketsBeingPeerReceived(header.sn, header.ts);
+			ParseUnacknowedged(header.una);
 			ShrinkBuf();
 
 			if (header.cmd == KcpCommand.Ack)
@@ -697,27 +732,27 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		snd_una = snd_buf.Count > 0 ? snd_buf.First!.Value.HeaderAnyEndian.sn : snd_nxt;
 	}
 
-	protected void FreePacketsBeingPeerReceived(uint sn, uint ts)
+	protected void ParseUnacknowedged(uint una)
 	{
-		if (TimeDiffSigned(sn, snd_una) < 0 || TimeDiffSigned(sn, snd_nxt) >= 0)
-			return;
-
 		// p = p.Next看着吓人但是目前版本(NET10)能行
 		for (var p = snd_buf.First; p != null; p = p.Next)
 		{
 			PacketBuffer packet = p.Value;
-			if (TimeDiffSigned(sn, packet.HeaderAnyEndian.sn) < 0)
+			if (TimeDiffSigned(una, packet.HeaderAnyEndian.sn) > 0)
+			{
+				snd_buf.Remove(p);
+
+				if (packet.PacketFinished is not null)
+				{
+					// 通知SendAsync()该报文已送达，准备收回控制权
+					packet.PacketFinished.TrySetResult();
+					packet.PacketFinished = null; // 使该包与TCS不再关联，避免通知两次
+				}
+				packet.Dispose();
+			}
+			else
 			{
 				break;
-			}
-			else if (sn != packet.HeaderAnyEndian.sn)
-			{
-#if !IKCP_FASTACK_CONSERVE
-				packet.PacketControlFields.fastack++;
-#else
-				if (TimeDiffSigned(ts, packet.HeaderAnyEndian.ts) >= 0)
-					packet.PacketControlFields.fastack++;
-#endif
 			}
 		}
 	}
@@ -789,7 +824,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			if (rcv_queue.Count == 0)
 			{
 				Debug.Assert(rcv_queue.Count != 0, "AdvanceFragment called more than available fragments. Thread race or internal bugs?");
-				var ex = new InvalidOperationException("[FaGe.Kcp] 内部错误，需要释放的分片数量超过已接收的分片数量。" + Environment.NewLine + 
+				var ex = new InvalidOperationException("[FaGe.Kcp] 内部错误，需要释放的分片数量超过已接收的分片数量。" + Environment.NewLine +
 					$"\t可能的原因是：多线程竞争同一连接，或FaGe.Kcp内部存在bug。请查看{nameof(Exception)}.{nameof(Exception.Data)}获取更多信息");
 
 				ex.Data["ConnectionId"] = conv;
@@ -806,18 +841,77 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 	#region 异步收发API
 
-	public virtual ValueTask<KcpSendResult> SendAsync(
+	protected ValueTask<KcpSendResult> SendAsyncBase(
 		ReadOnlyMemory<byte> buffer,
 		CancellationToken cancellationToken)
 	{
-		
+		TaskCompletionSource signalSource = new();
+		Task signal = signalSource.Task;
+		var result = QueueToSenderWithAsyncSource(buffer, signalSource, cancellationToken);
+
+		if (signal.IsCompleted)
+		{
+			return ValueTask.FromResult(result);
+		}
+		else
+		{
+			static async ValueTask<KcpSendResult> SendAsyncCore(KcpSendResult result, CancellationToken cancellationToken)
+			{
+				// 若取消，放出控制权之前throw，避免死锁
+				cancellationToken.ThrowIfCancellationRequested();
+
+				Debug.Assert(result.asyncSendTask != null, "");
+				await result.asyncSendTask;
+
+				return result;
+			}
+
+			return SendAsyncCore(result, cancellationToken);
+		}
 	}
 
-	public virtual ValueTask<KcpRecvResult> ReceiveAsync(
-		Memory<byte> buffer,
-		CancellationToken cancellationToken)
+	protected ValueTask<KcpApplicationPacket> ReceiveAsyncBase(CancellationToken cancellationToken)
 	{
-		
+		var appPacket = TryReadPacket(cancellationToken);
+		if (!appPacket.IsNotEmpty)
+			return ValueTask.FromResult(appPacket);
+
+		TaskCompletionSource signalSource = new();
+		Task signal = signalSource.Task;
+		pendingReceiveTaskSource = signalSource;
+
+		if (signal.IsCompleted)
+		{
+			return ValueTask.FromResult(TryReadPacket(cancellationToken));
+		}
+		else
+		{
+			static async ValueTask<KcpApplicationPacket> ReceiveAsyncCore(KcpApplicationPacket result, KcpConnectionBase kcp, TaskCompletionSource currentRecvSource, CancellationToken cancellationToken)
+			{
+				// 若取消，放出控制权之前throw，避免死锁
+				cancellationToken.ThrowIfCancellationRequested();
+
+				Debug.Assert(kcp.pendingReceiveTaskSource == currentRecvSource, "Race condition or internal bugs detected.");
+				if (kcp.pendingReceiveTaskSource != currentRecvSource)
+				{
+					var ex = new InvalidOperationException("[FaGe.Kcp] 异步接收内部状态不一致。" + Environment.NewLine +
+						$"\t可能是由竞态条件或内部bug导致的，详情见{nameof(Exception)}.{nameof(Exception.Data)}");
+
+					ex.Data["ConnectionId"] = kcp.conv;
+					ex.Data["Instance"] = kcp;
+					ex.Data["CurrentThreadId"] = Environment.CurrentManagedThreadId;
+					ex.Data["ExpectedReceiveSource"] = currentRecvSource;
+					ex.Data["CurrentReceiveSource"] = kcp.pendingReceiveTaskSource;
+
+					throw ex;
+				}
+				await currentRecvSource.Task;
+
+				return result;
+			}
+
+			return ReceiveAsyncCore(appPacket, this, signalSource, cancellationToken);
+		}
 	}
 
 	#endregion
@@ -1030,6 +1124,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			var probeHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowProbe });
 			var encodeSpan = currentEncodingBuffer.Span;
 			probeHeader.Write(ref encodeSpan);
+			currentEncodingBuffer = currentEncodingBuffer[..(currentEncodingBuffer.Length - encodeSpan.Length)];
 		}
 
 		// 发送探测包（通知远端我们的窗口大小）
@@ -1046,6 +1141,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			var probeHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowSizeTell });
 			var encodeSpan = currentEncodingBuffer.Span;
 			probeHeader.Write(ref encodeSpan);
+			currentEncodingBuffer = currentEncodingBuffer[..(currentEncodingBuffer.Length - encodeSpan.Length)];
 		}
 
 		probe = AskType.None;
@@ -1141,6 +1237,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 			if (needsend)
 			{
+				// 这里是重传，之前已经通知过上层了，不需要再通知
 				segment.HeaderAnyEndian = segment.HeaderAnyEndian with
 				{
 					ts = tickNow,
@@ -1341,41 +1438,25 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			{
 				DisposeBuffers();
 
-				sendPipe.Reset();
-				receivePipe.Reset();
 			}
 
 			disposedValue = true;
 		}
 	}
 
-	public ValueTask DisposeAsync()
+	public async ValueTask DisposeAsync()
 	{
 		disposedValue = true;
+		foreach (var packet in snd_buf)
+			packet.DisposeCts?.Cancel();
+		foreach (var packet in snd_queue)
+			packet.DisposeCts?.Cancel();
+		foreach (var packet in rcv_buf)
+			packet.DisposeCts?.Cancel();
+		foreach (var packet in rcv_queue)
+			packet.DisposeCts?.Cancel();
+
 		DisposeBuffers();
-
-		ValueTask completeSend = sendPipe.Reader.CompleteAsync();
-		ValueTask completeReceive = receivePipe.Writer.CompleteAsync();
-		ValueTaskAwaiter awaiter = completeSend.GetAwaiter();
-		if (awaiter.IsCompleted)
-		{
-			completeSend = ValueTask.CompletedTask;
-			awaiter.GetResult();
-			awaiter = completeReceive.GetAwaiter();
-			if (awaiter.IsCompleted)
-			{
-				awaiter.GetResult();
-				return ValueTask.CompletedTask;
-			}
-		}
-
-		return DisposeAsyncAwaited(completeSend, completeReceive);
-
-		static async ValueTask DisposeAsyncAwaited(ValueTask completeSend, ValueTask completeReceive)
-		{
-			await completeSend;
-			await completeReceive;
-		}
 	}
 
 	private void DisposeBuffers()
