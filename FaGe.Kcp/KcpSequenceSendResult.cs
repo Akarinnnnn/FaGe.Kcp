@@ -10,7 +10,7 @@ public readonly record struct KcpSequenceSendResult(long? SentCount, KcpSendStat
 
 	public static KcpSequenceSendResult Succeed(long sentCount) => new(sentCount, KcpSendStatus.Succeed);
 	public static KcpSequenceSendResult Fail(KcpSendStatus reason) => new(null, reason);
-	
+
 }
 
 public readonly record struct KcpSendResult(int? SentCount, KcpSendStatus FailReason)

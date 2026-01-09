@@ -12,7 +12,7 @@ namespace FaGe.Kcp
 				: IDisposable
 	{
 		private RentBuffer rentBuffer = new(expectedCapacity + IKCP_OVERHEAD, bufferSource);
-		
+
 		internal TaskCompletionSource? PacketFinished { get; private set; }
 
 		internal CancellationTokenSource? DisposeCts { get; private set; }
@@ -32,7 +32,7 @@ namespace FaGe.Kcp
 
 		// 不返回ref readonly，因为构造后可能需要修改
 		internal ref KcpPacketHeaderAnyEndian HeaderAnyEndian =>
-				ref Unsafe.As<byte, KcpPacketHeaderAnyEndian>(ref HeaderMemory.Span.GetPinnableReference()); 
+				ref Unsafe.As<byte, KcpPacketHeaderAnyEndian>(ref HeaderMemory.Span.GetPinnableReference());
 
 		/// <summary>
 		/// 
@@ -150,7 +150,7 @@ namespace FaGe.Kcp
 		public static PacketBuffer FromNetwork(ReadOnlyMemory<byte> packetBuffer, ArrayPool<byte> bufferSource)
 		{
 			PacketBuffer result = new(bufferSource, packetBuffer.Length, false);
-			
+
 			if (result.rentBuffer.Buffer!.Length < packetBuffer.Length)
 				result.rentBuffer.EnsureCapacity(packetBuffer.Length);
 
@@ -163,6 +163,7 @@ namespace FaGe.Kcp
 
 		public void Dispose()
 		{
+			DisposeCts?.Cancel();
 			rentBuffer.Dispose();
 		}
 	}

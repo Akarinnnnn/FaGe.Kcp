@@ -44,7 +44,7 @@ namespace FaGe.Kcp.Utility
 			ObjectDisposedException.ThrowIf(Buffer == null, typeof(RentBuffer));
 
 			if (Buffer.Length < newSize)
-			{ 
+			{
 				var buffer = source.Rent(newSize);
 				Buffer.AsSpan().CopyTo(buffer.AsSpan());
 				Dispose();

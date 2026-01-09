@@ -746,7 +746,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				{
 					// 通知SendAsync()该报文已送达，准备收回控制权
 					packet.PacketFinished.TrySetResult();
-					packet.PacketFinished = null; // 使该包与TCS不再关联，避免通知两次
 				}
 				packet.Dispose();
 			}
@@ -1158,7 +1157,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		{
 			if (snd_queue.TryDequeue(out var packet))
 			{
-				var pushHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with
+				var pushHeader = genericHeader.ValueAnyEndian with
 				{
 					cmd = KcpCommand.Push,
 					// wnd 已经在genericHeader中设置
@@ -1166,9 +1165,9 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 					sn = snd_nxt,
 					una = rcv_nxt,
 
-				});
+				};
 
-				packet.HeaderAnyEndian = pushHeader.ValueAnyEndian;
+				packet.HeaderAnyEndian = pushHeader;
 
 				packet.PacketControlFields.resendts = tickNow;
 				packet.PacketControlFields.rto = rx_rto;
