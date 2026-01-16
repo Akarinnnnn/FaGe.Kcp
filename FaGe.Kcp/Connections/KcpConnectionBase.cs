@@ -35,10 +35,10 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	/// 最大报文段长度
 	/// </summary>
 	protected uint mss;
-	/// <summary>
-	/// 连接状态（0xFFFFFFFF表示断开连接）
-	/// </summary>
-	protected int state;
+	///// <summary>
+	///// 连接状态（0xFFFFFFFF表示断开连接）
+	///// </summary>
+	// protected int state;
 	/// <summary>
 	/// 第一个未确认的包
 	/// </summary>
@@ -164,12 +164,18 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 	private bool disposedValue;
 
+	private uint maxRcvWindow = IKCP_WND_RCV;
+	private bool isWindowFull = false;
+
 	[Obsolete]
 	private int stream => IsStreamMode ? 1 : 0;
 
 	private int ThreeMtuPacketBufferSize => (int)(3 * (MTU + IKCP_OVERHEAD));
 
 #pragma warning restore
+
+	public int ConnectionId => (int)conv;
+	public uint ConnectionIdUnsigned => conv;
 
 	// Pipe传输模式开的洞
 	//private readonly Pipe sendPipe = new();
@@ -220,6 +226,23 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		}
 	}
 
+	public bool IsWindowFull => isWindowFull;  // 窗口是否已满（只读）
+
+	public int MaxReceiveWindow                 // 最大接收窗口硬限制
+	{
+		get => (int)maxRcvWindow;
+		set
+		{
+			ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, nameof(MaxReceiveWindow));
+			ArgumentOutOfRangeException.ThrowIfGreaterThan(value, IKCP_WND_RCV, nameof(MaxReceiveWindow));
+
+			maxRcvWindow = (uint)value;
+
+			// 如果当前窗口大于新的最大值，自动调整
+			if (rcv_wnd > maxRcvWindow)
+				rcv_wnd = maxRcvWindow;
+		}
+	}
 	public int MaxUserTransferLength => (int)mss;
 
 	public int SendWindowSize
@@ -278,7 +301,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		}
 	}
 
-	public KcpConnectionState State { get; private set; }
 
 	/// <summary>
 	/// 调用输出回调以发送数据。
@@ -341,7 +363,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		{
 			if (source is not null)
 			{
-				packetOfLastFragment?.SetPacketFinished(source, ct);
+				packetOfLastFragment?.SetOnPacketFinished(source, ct);
 				return KcpSendResult.Succeed(sent, source);
 			}
 			else
@@ -363,7 +385,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			{
 				if (source is not null)
 				{
-					packetOfLastFragment?.SetPacketFinished(source, ct);
+					packetOfLastFragment?.SetOnPacketFinished(source, ct);
 					return KcpSendResult.Succeed(sent, source);
 				}
 				else
@@ -402,7 +424,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			newPacket.Advance(size);
 			buffer = buffer[size..];
 
-			newPacket.HeaderAnyEndian.frg = IsStreamMode
+			newPacket.HeaderRef.frg = IsStreamMode
 				? (byte)(packetCount - i - 1) // 6packets idx: [5, 4, 3, 2, 1, 0] 
 				: (byte)0;
 
@@ -414,7 +436,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 		if (source is not null)
 		{
-			packetOfLastFragment?.SetPacketFinished(source, ct);
+			packetOfLastFragment?.SetOnPacketFinished(source, ct);
 			return KcpSendResult.Succeed(sent, source);
 		}
 		else
@@ -448,7 +470,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 			if (KcpPacketHeader.TryRead(buffer.Span, out var headerDecoded))
 			{
-				return new(-2);
+				return new(-1);
 			}
 
 			KcpPacketHeaderAnyEndian header = headerDecoded.ValueAnyEndian;
@@ -458,7 +480,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				return new(-1);
 
 			if (buffer.Length < header.len)
-				return new(-2);
+				return new(-3);
 
 			switch (header.cmd)
 			{
@@ -577,11 +599,11 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 		foreach (var packet in snd_buf)
 		{
-			if (TimeDiffSigned(sn, packet.HeaderAnyEndian.sn) < 0)
+			if (TimeDiffSigned(sn, packet.HeaderRef.sn) < 0)
 			{
 				break;
 			}
-			else if (sn != packet.HeaderAnyEndian.sn)
+			else if (sn != packet.HeaderRef.sn)
 			{
 #if !IKCP_FASTACK_CONSERVE
 				packet.PacketControlFields.fastack++;
@@ -597,7 +619,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 	private void ParseData(PacketBuffer packet)
 	{
-		uint sn = packet.HeaderAnyEndian.sn;
+		uint sn = packet.HeaderRef.sn;
 
 		if (TimeDiffSigned(sn, rcv_nxt + rcv_wnd) >= 0 ||
 			TimeDiffSigned(sn, rcv_nxt) < 0)
@@ -611,13 +633,13 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		for (p = rcv_buf.Last; p != null; p = p.Previous)
 		{
 			var checkingPacket = p.Value;
-			if (checkingPacket.HeaderAnyEndian.sn == packet.HeaderAnyEndian.sn)
+			if (checkingPacket.HeaderRef.sn == packet.HeaderRef.sn)
 			{
 				isRepeat = true;
 				break;
 			}
 
-			if (TimeDiffSigned(sn, packet.HeaderAnyEndian.sn) > 0)
+			if (TimeDiffSigned(sn, packet.HeaderRef.sn) > 0)
 			{
 				break;
 			}
@@ -629,12 +651,12 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 			if (p == null)
 			{
-				if (packet.HeaderAnyEndian.frg + 1 > rcv_wnd)
+				if (packet.HeaderRef.frg + 1 > rcv_wnd)
 				{
 					InvokeOnConnectionWasClosed();
 					// 这里不要dispose，让上层处理
-					throw new KcpInputException($"sn={packet.HeaderAnyEndian.sn}的分片包" +
-						$"（{packet.HeaderAnyEndian.frg + 1}片），分片长度超过接收窗口，无法继续接收。", 1);
+					throw new KcpInputException($"sn={packet.HeaderRef.sn}的分片包" +
+						$"（{packet.HeaderRef.frg + 1}片），分片长度超过接收窗口，无法继续接收。", 1);
 				}
 
 				rcv_buf.AddFirst(packet);
@@ -654,7 +676,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		{
 			var first = rcv_buf.First!;
 			var firstPacket = first.Value;
-			var firstSn = firstPacket.HeaderAnyEndian.sn;
+			var firstSn = firstPacket.HeaderRef.sn;
 			if (firstSn == rcv_nxt && rcv_queue.Count < RecvWindowSize)
 			{
 				rcv_buf.RemoveFirst();
@@ -680,14 +702,21 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		for (var p = snd_buf.First; p != null; p = p.Next)
 		{
 			var packet = p.Value;
-			if (sn == packet.HeaderAnyEndian.sn)
+			if (sn == packet.HeaderRef.sn)
 			{
 				snd_buf.Remove(p);
+
+				if (packet.AsyncState is not null)
+				{
+					// 通知SendAsync()该报文已送达，准备收回控制权
+					packet.AsyncState.TrySetResult();
+					packet.DisassociateAsyncState(); // 使该包与TCS不再关联，避免通知两次
+				}
 				packet.Dispose();
 				break;
 			}
 
-			if (TimeDiffSigned(sn, packet.HeaderAnyEndian.sn) < 0)
+			if (TimeDiffSigned(sn, packet.HeaderRef.sn) < 0)
 			{
 				break;
 			}
@@ -729,7 +758,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 	private void ShrinkBuf()
 	{
-		snd_una = snd_buf.Count > 0 ? snd_buf.First!.Value.HeaderAnyEndian.sn : snd_nxt;
+		snd_una = snd_buf.Count > 0 ? snd_buf.First!.Value.HeaderRef.sn : snd_nxt;
 	}
 
 	protected void ParseUnacknowedged(uint una)
@@ -738,14 +767,15 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		for (var p = snd_buf.First; p != null; p = p.Next)
 		{
 			PacketBuffer packet = p.Value;
-			if (TimeDiffSigned(una, packet.HeaderAnyEndian.sn) > 0)
+			if (TimeDiffSigned(una, packet.HeaderRef.sn) > 0)
 			{
 				snd_buf.Remove(p);
 
-				if (packet.PacketFinished is not null)
+				if (packet.AsyncState is not null)
 				{
 					// 通知SendAsync()该报文已送达，准备收回控制权
-					packet.PacketFinished.TrySetResult();
+					packet.AsyncState.TrySetResult();
+					packet.DisassociateAsyncState(); // 使该包与TCS不再关联，避免通知两次
 				}
 				packet.Dispose();
 			}
@@ -780,7 +810,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		SimpleSegment? segTail = null;
 		PacketBuffer packet = rcv_queue.Peek();
 		Debug.Assert(packet.IsMachineEndian, "此包未经处理，直接传入了上层？");
-		byte frg = packet.HeaderAnyEndian.frg;
+		byte frg = packet.HeaderRef.frg;
 		if (frg == 0)
 		{
 			fragmentCount = 0;
@@ -818,7 +848,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 	internal void AdvanceFragment(int packetFragmentsCount)
 	{
-		for (int i = 0; i < packetFragmentsCount; i++)
+		for (int i = 0; i <= packetFragmentsCount; i++)
 		{
 			if (rcv_queue.Count == 0)
 			{
@@ -1167,7 +1197,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 				};
 
-				packet.HeaderAnyEndian = pushHeader;
+				packet.HeaderRef = pushHeader;
 
 				packet.PacketControlFields.resendts = tickNow;
 				packet.PacketControlFields.rto = rx_rto;
@@ -1190,61 +1220,64 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		// flush data segments
 		foreach (var item in snd_buf)
 		{
-			var segment = item;
+			var packet = item;
 			var needsend = false;
 
-			if (segment.PacketControlFields.xmit == 0)
+			if (packet.PacketControlFields.xmit == 0)
 			{
 				//新加入 snd_buf 中, 从未发送过的报文直接发送出去;
 				needsend = true;
-				segment.PacketControlFields.xmit++;
-				segment.PacketControlFields.rto = rx_rto;
-				segment.PacketControlFields.resendts = tickNow + rx_rto + rtomin;
+				packet.PacketControlFields.xmit++;
+				packet.PacketControlFields.rto = rx_rto;
+				packet.PacketControlFields.resendts = tickNow + rx_rto + rtomin;
 			}
-			else if (TimeDiffSigned(tickNow, segment.PacketControlFields.resendts) >= 0)
+			else if (TimeDiffSigned(tickNow, packet.PacketControlFields.resendts) >= 0)
 			{
 				//发送过的, 但是在 RTO 内未收到 ACK 的报文, 需要重传;
 				needsend = true;
-				segment.PacketControlFields.xmit++;
+				packet.PacketControlFields.xmit++;
 				xmit++;
 				if (IsNoDelayMode)
 				{
-					segment.PacketControlFields.rto += Math.Max(segment.PacketControlFields.rto, rx_rto);
+					packet.PacketControlFields.rto += Math.Max(packet.PacketControlFields.rto, rx_rto);
 				}
 				else
 				{
-					var step = nodelay < 2 ? segment.PacketControlFields.rto : rx_rto;
-					segment.PacketControlFields.rto += step / 2;
+					var step = nodelay < 2 ? packet.PacketControlFields.rto : rx_rto;
+					packet.PacketControlFields.rto += step / 2;
 				}
 
-				segment.PacketControlFields.resendts = tickNow + segment.PacketControlFields.rto;
+				packet.PacketControlFields.resendts = tickNow + packet.PacketControlFields.rto;
 				lost = true;
 			}
-			else if (segment.PacketControlFields.fastack >= resent)
+			else if (packet.PacketControlFields.fastack >= resent)
 			{
 				//发送过的, 但是 ACK 失序若干次的报文, 需要执行快速重传.
-				if (segment.PacketControlFields.xmit <= fastlimit
+				if (packet.PacketControlFields.xmit <= fastlimit
 					|| fastlimit <= 0)
 				{
 					needsend = true;
-					segment.PacketControlFields.xmit++;
-					segment.PacketControlFields.fastack = 0;
-					segment.PacketControlFields.resendts = tickNow + segment.PacketControlFields.rto;
+					packet.PacketControlFields.xmit++;
+					packet.PacketControlFields.fastack = 0;
+					packet.PacketControlFields.resendts = tickNow + packet.PacketControlFields.rto;
 					change++;
 				}
 			}
 
 			if (needsend)
 			{
-				// 这里是重传，之前已经通知过上层了，不需要再通知
-				segment.HeaderAnyEndian = segment.HeaderAnyEndian with
+				// 通知上层该报文将被发送（或重传）
+				packet.PacketCompleted?.SetResult();
+				packet.MarkPacketCompleted();
+
+				packet.HeaderRef = packet.HeaderRef with
 				{
 					ts = tickNow,
 					wnd = genericHeader.ValueAnyEndian.wnd, // 特殊方式获取方法开始时的wnd值
 					una = rcv_nxt,
 				};
 
-				var need = IKCP_OVERHEAD + segment.Length;
+				var need = IKCP_OVERHEAD + packet.Length;
 				// using RentBuffer buffer = new((int)MTU + IKCP_OVERHEAD, ArrayPool<byte>.Shared);
 				int size = GetEncodedBufferLength(genericEncodingBuffer, currentEncodingBuffer);
 				if (need > MTU)
@@ -1255,7 +1288,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 				// offset += segment.Encode(buffer.Memory.Span.Slice(offset));
 				var span = currentEncodingBuffer.Span;
-				if (segment.Encode(ref span, out int encodedLength) == OperationStatus.Done)
+				if (packet.Encode(ref span, out int encodedLength) == OperationStatus.Done)
 				{
 					currentEncodingBuffer = currentEncodingBuffer[encodedLength..];
 				}
@@ -1270,10 +1303,11 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				//	LogWriteLine($"{segment.ToLogString(true)}", KcpLogMask.IKCP_LOG_NEED_SEND.ToString());
 				//}
 
-				if (segment.PacketControlFields.xmit >= dead_link)
+				if (packet.PacketControlFields.xmit >= dead_link)
 				{
 					state = -1;
 
+					Dispose();
 					// TODO 用EventSource改写
 					//if (CanLog(KcpLogMask.IKCP_LOG_DEAD_LINK))
 					//{
@@ -1326,7 +1360,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			}
 			#endregion
 
-			if (state == -1)
+			if (IsDisposed)
 			{
 				InvokeOnConnectionWasClosed();
 			}
@@ -1337,6 +1371,34 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			return all.Length - remaining.Length;
 		}
 	}
+
+	private void CancelAllPendingAsyncOperations()
+	{
+		foreach (var packet in snd_buf)
+		{
+			packet.DisposeCts?.Cancel();
+			packet.DisassociateAsyncState();
+		}
+		snd_buf.Clear();
+        foreach (var packet in snd_queue)
+		{
+			packet.DisposeCts?.Cancel();
+			packet.DisassociateAsyncState();
+		}
+		snd_queue.Clear();
+        foreach (var packet in rcv_buf)
+		{
+			packet.DisposeCts?.Cancel();
+			packet.DisassociateAsyncState();
+		}
+		rcv_buf.Clear();
+        foreach (var packet in rcv_queue)
+		{
+			packet.DisposeCts?.Cancel();
+			packet.DisassociateAsyncState();
+		}
+		rcv_queue.Clear();
+    }
 
 	/// <summary>
 	/// 获取将要接收的下一个消息的总长度（包括分包拼接后的长度）。如果没有完整的消息可供接收，则返回-1。
@@ -1352,7 +1414,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 		PacketBuffer packet = rcv_queue.Peek();
 
-		KcpPacketHeaderAnyEndian header = packet.HeaderAnyEndian;
+		KcpPacketHeaderAnyEndian header = packet.HeaderRef;
 		if (header.frg == 0)
 			return (int)header.len;
 
@@ -1435,8 +1497,8 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		{
 			if (disposing)
 			{
+				CancelAllPendingAsyncOperations();
 				DisposeBuffers();
-
 			}
 
 			disposedValue = true;
@@ -1446,15 +1508,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	public async ValueTask DisposeAsync()
 	{
 		disposedValue = true;
-		foreach (var packet in snd_buf)
-			packet.DisposeCts?.Cancel();
-		foreach (var packet in snd_queue)
-			packet.DisposeCts?.Cancel();
-		foreach (var packet in rcv_buf)
-			packet.DisposeCts?.Cancel();
-		foreach (var packet in rcv_queue)
-			packet.DisposeCts?.Cancel();
-
+		CancelAllPendingAsyncOperations();
 		DisposeBuffers();
 	}
 

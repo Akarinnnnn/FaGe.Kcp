@@ -12,44 +12,54 @@ namespace FaGe.Kcp
 				: IDisposable
 	{
 		private RentBuffer rentBuffer = new(expectedCapacity + IKCP_OVERHEAD, bufferSource);
-
-		internal TaskCompletionSource? PacketFinished { get; private set; }
+		
+		internal TaskCompletionSource? AsyncState { get; private set; }
 
 		internal CancellationTokenSource? DisposeCts { get; private set; }
 
-		internal void SetPacketFinished(TaskCompletionSource tcs, CancellationToken ct)
+		internal void SetOnPacketFinished(TaskCompletionSource tcs, CancellationToken ct)
 		{
-			PacketFinished = tcs;
+			AsyncState = tcs;
 			DisposeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 			DisposeCts.Token.Register(() =>
 			{
-				tcs.TrySetCanceled(DisposeCts.Token);
+				AsyncState.TrySetCanceled(DisposeCts.Token);
 				Dispose();
 			});
+		}
+
+		internal void MarkPacketCompleted()
+		{
+			DisposeCts?.Dispose();
+
+			DisposeCts = null;
+			AsyncState = null;
 		}
 
 		public bool IsMachineEndian { get; private set; } = isMachineEndian;
 
 		// 不返回ref readonly，因为构造后可能需要修改
-		internal ref KcpPacketHeaderAnyEndian HeaderAnyEndian =>
+		internal ref KcpPacketHeaderAnyEndian HeaderRef =>
 				ref Unsafe.As<byte, KcpPacketHeaderAnyEndian>(ref HeaderMemory.Span.GetPinnableReference());
+
+		public KcpPacketHeaderAnyEndian HeaderAnyEndian => HeaderRef;
 
 		/// <summary>
 		/// 
 		/// </summary>
-		public KcpPacketHeader Header => new(HeaderAnyEndian, IsMachineEndian);
+		public KcpPacketHeader Header => new(HeaderRef, IsMachineEndian);
 
 		public PacketBuffer(ArrayPool<byte> bufferSource, KcpPacketHeader header = default, int expectedCapacity = 0)
 			: this(bufferSource, expectedCapacity, header.IsMachineEndian)
 		{
-			HeaderAnyEndian = header.ValueAnyEndian;
+			HeaderRef = header.ValueAnyEndian;
 			IsMachineEndian = header.IsMachineEndian;
 		}
 
 		/// <summary>
 		/// 开始写入数据的偏移量
 		/// </summary>
-		public int WritingBeginOffset;
+		public int WritingBeginOffset => Length + IKCP_OVERHEAD;
 		/// <summary>
 		/// 写入的数据长度
 		/// </summary>
@@ -75,7 +85,7 @@ namespace FaGe.Kcp
 		/// <summary>
 		/// Buffer剩余空间视图
 		/// </summary>
-		public Memory<byte> RemainingMemory => RentBuffer[(WritingBeginOffset + IKCP_OVERHEAD)..];
+		public Memory<byte> RemainingMemory => RentBuffer[WritingBeginOffset..];
 
 		/// <summary>
 		/// 全包视图
@@ -88,7 +98,7 @@ namespace FaGe.Kcp
 		{
 			if (!IsMachineEndian && !BitConverter.IsLittleEndian) // 改大端要改这里
 			{
-				HeaderAnyEndian = HeaderAnyEndian.ReverseEndianness();
+				HeaderRef = HeaderRef.ReverseEndianness();
 				IsMachineEndian = true;
 			}
 		}
@@ -97,7 +107,7 @@ namespace FaGe.Kcp
 		{
 			if (IsMachineEndian && !BitConverter.IsLittleEndian) // 改大端要改这里
 			{
-				HeaderAnyEndian = HeaderAnyEndian.ReverseEndianness();
+				HeaderRef = HeaderRef.ReverseEndianness();
 				IsMachineEndian = false;
 			}
 		}
@@ -126,7 +136,6 @@ namespace FaGe.Kcp
 			Debug.Assert(PayloadMemory.Length <= Length + count);
 
 			Length += count;
-			WritingBeginOffset += count;
 		}
 
 		public OperationStatus Encode(ref Span<byte> span, out int encodedLength)
@@ -136,6 +145,8 @@ namespace FaGe.Kcp
 				encodedLength = 0;
 				return OperationStatus.DestinationTooSmall;
 			}
+
+			HeaderRef.len = (uint)Length;
 
 			ConvertHeaderToNetworkEndian();
 

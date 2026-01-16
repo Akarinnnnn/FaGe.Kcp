@@ -47,13 +47,43 @@ public sealed class KcpConnection(UdpClient udpTransport, uint connectionId, IPE
 		static async ValueTask DiscardBytesSent(ValueTask<int> discarding) => _ = await discarding;
 	}
 
-	public ValueTask<KcpSendResult> SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+	public async Task RunReceiveLoop(CancellationToken cancellationToken)
 	{
-		return SendAsyncBase(buffer, cancellationToken);
+		while (!cancellationToken.IsCancellationRequested)
+		{
+			UdpReceiveResult result = await udpTransport.ReceiveAsync(cancellationToken);
+			KcpInputResult kcpInputResult = InputFromUnderlyingTransport(result.Buffer);
+			if (kcpInputResult.IsFailed)
+			{
+				switch (kcpInputResult.RawResult)
+				{
+					case -2:
+						Trace.WriteLine("出现了意料外的CMD，可能是因为对等端不是标准KCP实现");
+						break;
+					case -1:
+						Trace.WriteLine("输入数据包太短");
+						break;
+					default:
+						break;
+				}
+			}
+		}
 	}
 
-	public ValueTask<KcpApplicationPacket> ReceiveAsync(CancellationToken cancellationToken = default)
+	public ValueTask<KcpSendResult> SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
 	{
-		return ReceiveAsyncBase(cancellationToken);
+		while (!cancellationToken.IsCancellationRequested)
+		{
+			UdpReceiveResult result = await udpTransport.ReceiveAsync(cancellationToken);
+			KcpInputResult kcpInputResult = InputFromUnderlyingTransport(result.Buffer);
+			if (kcpInputResult.IsFailed)
+			{
+				// ETW
+				Trace.WriteLine($"[FaGe.KCP] KCP连接（ID={ConnectionId}）接收数据失败，错误码：{kcpInputResult.RawResult}");
+			}
+		}
 	}
+
+	public ValueTask<KcpSendResult> SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken) => SendAsyncBase(buffer, cancellationToken);
+	public ValueTask<KcpApplicationPacket> ReceiveAsync(CancellationToken cancellationToken) => ReceiveAsyncBase(cancellationToken);
 }

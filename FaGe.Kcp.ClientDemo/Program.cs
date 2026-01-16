@@ -3,11 +3,12 @@ using FaGe.Kcp.Connections;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Unicode;
 
 Console.WriteLine("Hello, World!");
-UdpClient designatedClient = new UdpClient(50001);
-designatedClient.Connect(new IPEndPoint(IPAddress.Loopback, 40001));
-KcpConnection kcpConnection = new KcpConnection(designatedClient, 2001);
+UdpClient designatedClient = new(50001);
+var remoteEp = new IPEndPoint(IPAddress.Loopback, 40001);
+KcpConnection kcpConnection = new KcpConnection(designatedClient, 2001, remoteEp);
 
 CancellationTokenSource cts = new CancellationTokenSource();
 ManualResetEventSlim exceptionStopEvent = new(false);
@@ -33,11 +34,15 @@ var send = Task.Run(async () =>
 		if (Console.ReadKey().Key == ConsoleKey.S)
 		{
 			// 发送数据
-			var result = kcpConnection.QueueToSender(sendBuffer, ct);
+			var result = await kcpConnection.SendAsync(sendBuffer, ct);
 			Console.WriteLine("Test FaGe.Kcp Message");
 			if (result.IsSucceed)
 			{
-				await kcpConnection.
+				var packet = await kcpConnection.ReceiveAsync(ct);
+				if (Utf8.IsValid(packet.Result.Buffer.FirstSpan))
+				{
+					Console.WriteLine(Encoding.UTF8.GetString(packet.Result.Buffer.FirstSpan));
+				}
 			}
 		}
 	}
