@@ -13,13 +13,13 @@ namespace FaGe.Kcp
 	{
 		private RentBuffer rentBuffer = new(expectedCapacity + IKCP_OVERHEAD, bufferSource);
 		
-		internal TaskCompletionSource? PacketFinished { get; private set; }
+		internal TaskCompletionSource? AsyncState { get; private set; }
 
 		internal CancellationTokenSource? DisposeCts { get; private set; }
 
 		internal void SetPacketFinished(TaskCompletionSource tcs, CancellationToken ct)
 		{
-			PacketFinished = tcs;
+			AsyncState = tcs;
 			DisposeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 			DisposeCts.Token.Register(() =>
 			{
@@ -164,6 +164,11 @@ namespace FaGe.Kcp
 		public void Dispose()
 		{
 			rentBuffer.Dispose();
+		}
+
+		internal void DisassociateAsyncState()
+		{
+			AsyncState = null;
 		}
 	}
 

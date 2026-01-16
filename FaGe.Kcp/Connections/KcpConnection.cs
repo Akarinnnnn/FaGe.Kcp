@@ -68,4 +68,21 @@ public sealed class KcpConnection(UdpClient udpTransport, uint connectionId) : K
 
 		static async ValueTask DiscardBytesSent(ValueTask<int> discarding) => _ = await discarding;
 	}
+
+	public async ValueTask ReceiveLoopAsync(CancellationToken cancellationToken)
+	{
+		while (!cancellationToken.IsCancellationRequested)
+		{
+			UdpReceiveResult result = await udpTransport.ReceiveAsync(cancellationToken);
+			KcpInputResult kcpInputResult = InputFromUnderlyingTransport(result.Buffer);
+			if (kcpInputResult.IsFailed)
+			{
+				// ETW
+				Trace.WriteLine($"[FaGe.KCP] KCP连接（ID={ConnectionId}）接收数据失败，错误码：{kcpInputResult.RawResult}");
+			}
+		}
+	}
+
+	public ValueTask<KcpSendResult> SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken) => SendAsyncBase(buffer, cancellationToken);
+	public ValueTask<KcpApplicationPacket> ReceiveAsync(CancellationToken cancellationToken) => ReceiveAsyncBase(cancellationToken);
 }

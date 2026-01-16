@@ -30,7 +30,7 @@ var send = Task.Run(() =>
 		if (Console.ReadKey().Key == ConsoleKey.S)
 		{
 			// 发送数据
-			var result = kcpConnection.QueueToSender(sendBuffer, ct);
+			var result = kcpConnection.async(sendBuffer, ct);
 			Console.WriteLine("Test FaGe.Kcp Message"); 
 		}
 	}

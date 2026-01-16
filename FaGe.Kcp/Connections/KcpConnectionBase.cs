@@ -35,10 +35,10 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	/// 最大报文段长度
 	/// </summary>
 	protected uint mss;
-	/// <summary>
-	/// 连接状态（0xFFFFFFFF表示断开连接）
-	/// </summary>
-	protected int state;
+	///// <summary>
+	///// 连接状态（0xFFFFFFFF表示断开连接）
+	///// </summary>
+	// protected int state;
 	/// <summary>
 	/// 第一个未确认的包
 	/// </summary>
@@ -171,6 +171,9 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 #pragma warning restore
 
+	public int ConnectionId => (int)conv;
+	public uint ConnectionIdUnsigned => conv;
+
 	// Pipe传输模式开的洞
 	//private readonly Pipe sendPipe = new();
 	//private readonly Pipe receivePipe = new();
@@ -278,7 +281,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		}
 	}
 
-	public KcpConnectionState State { get; private set; }
 
 	/// <summary>
 	/// 调用输出回调以发送数据。
@@ -683,6 +685,13 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			if (sn == packet.HeaderAnyEndian.sn)
 			{
 				snd_buf.Remove(p);
+
+				if (packet.AsyncState is not null)
+				{
+					// 通知SendAsync()该报文已送达，准备收回控制权
+					packet.AsyncState.TrySetResult();
+					packet.DisassociateAsyncState(); // 使该包与TCS不再关联，避免通知两次
+				}
 				packet.Dispose();
 				break;
 			}
@@ -742,11 +751,11 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			{
 				snd_buf.Remove(p);
 
-				if (packet.PacketFinished is not null)
+				if (packet.AsyncState is not null)
 				{
 					// 通知SendAsync()该报文已送达，准备收回控制权
-					packet.PacketFinished.TrySetResult();
-					packet.PacketFinished = null; // 使该包与TCS不再关联，避免通知两次
+					packet.AsyncState.TrySetResult();
+					packet.DisassociateAsyncState(); // 使该包与TCS不再关联，避免通知两次
 				}
 				packet.Dispose();
 			}
@@ -819,7 +828,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 	internal void AdvanceFragment(int packetFragmentsCount)
 	{
-		for (int i = 0; i < packetFragmentsCount; i++)
+		for (int i = 0; i <= packetFragmentsCount; i++)
 		{
 			if (rcv_queue.Count == 0)
 			{
@@ -1273,8 +1282,9 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 				if (segment.PacketControlFields.xmit >= dead_link)
 				{
-					state = -1;
+					IsDisposed = true;
 
+					CancelAllPendingAsyncOperations();
 					// TODO 用EventSource改写
 					//if (CanLog(KcpLogMask.IKCP_LOG_DEAD_LINK))
 					//{
@@ -1327,7 +1337,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			}
 			#endregion
 
-			if (state == -1)
+			if (IsDisposed)
 			{
 				InvokeOnConnectionWasClosed();
 			}
@@ -1336,6 +1346,30 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		static int GetEncodedBufferLength(ReadOnlyMemory<byte> all, ReadOnlyMemory<byte> remaining)
 		{
 			return all.Length - remaining.Length;
+		}
+	}
+
+	private void CancelAllPendingAsyncOperations()
+	{
+		foreach (var packet in snd_buf)
+		{
+			packet.DisposeCts?.Cancel();
+			packet.DisassociateAsyncState();
+		}
+		foreach (var packet in snd_queue)
+		{
+			packet.DisposeCts?.Cancel();
+			packet.DisassociateAsyncState();
+		}
+		foreach (var packet in rcv_buf)
+		{
+			packet.DisposeCts?.Cancel();
+			packet.DisassociateAsyncState();
+		}
+		foreach (var packet in rcv_queue)
+		{
+			packet.DisposeCts?.Cancel();
+			packet.DisassociateAsyncState();
 		}
 	}
 
@@ -1436,8 +1470,8 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		{
 			if (disposing)
 			{
+				CancelAllPendingAsyncOperations();
 				DisposeBuffers();
-
 			}
 
 			disposedValue = true;
@@ -1447,15 +1481,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	public async ValueTask DisposeAsync()
 	{
 		disposedValue = true;
-		foreach (var packet in snd_buf)
-			packet.DisposeCts?.Cancel();
-		foreach (var packet in snd_queue)
-			packet.DisposeCts?.Cancel();
-		foreach (var packet in rcv_buf)
-			packet.DisposeCts?.Cancel();
-		foreach (var packet in rcv_queue)
-			packet.DisposeCts?.Cancel();
-
+		CancelAllPendingAsyncOperations();
 		DisposeBuffers();
 	}
 

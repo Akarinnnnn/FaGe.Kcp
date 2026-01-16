@@ -8,22 +8,6 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-	  <Compile Remove="Connections\Features\IKcpConfigurationFeature.cs" />
-	  <Compile Remove="Connections\Features\IKcpDefaultsFeature.cs" />
-	  <Compile Remove="Connections\Features\IKcpFeature.cs" />
-	  <Compile Remove="Connections\KcpConnectionContext.cs" />
-	  <Compile Remove="Connections\KcpConnectionContext.Features.cs" />
-	</ItemGroup>
-
-	<ItemGroup>
 		<FrameworkReference Include="Microsoft.AspNetCore.App" />
-	</ItemGroup>
-
-	<ItemGroup>
-	  <None Include="Connections\Features\IKcpConfigurationFeature.cs" />
-	  <None Include="Connections\Features\IKcpDefaultsFeature.cs" />
-	  <None Include="Connections\Features\IKcpFeature.cs" />
-	  <None Include="Connections\KcpConnectionContext.cs" />
-	  <None Include="Connections\KcpConnectionContext.Features.cs" />
 	</ItemGroup>
 </Project>
