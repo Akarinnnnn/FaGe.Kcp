@@ -23,10 +23,10 @@ using System.Buffers;
 namespace DanmakuR.Protocol.Buffer;
 
 /// <summary>
-/// A simple implementation of <see cref="ReadOnlySequenceSegment{byte}"/> for creating linked segments of byte memory.
+/// A simple implementation of <see cref="ReadOnlySequenceSegment{T}"/> for creating linked segments of byte memory.
 /// without any ownership or pooling logic.
 /// In case of you manage the memory outside of this class, this class will not dispose or free the memory as you wish.
-/// This is useful for testing or simple scenarios where you need to create a <see cref="ReadOnlySequence{byte}"/>.
+/// This is useful for testing or simple scenarios where you need to create a <see cref="ReadOnlySequence{T}"/>.
 /// </summary>
 // 没想到多年前写的代码还能派上用场
 internal class SimpleSegment : ReadOnlySequenceSegment<byte>

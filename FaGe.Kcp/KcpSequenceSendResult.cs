@@ -31,9 +31,4 @@ public readonly record struct KcpSendResult(int? SentCount, KcpSendStatus FailRe
 	public static KcpSendResult Succeed(int sentCount) => new(sentCount, KcpSendStatus.Succeed);
 
 	public static KcpSendResult Fail(KcpSendStatus reason) => new(null, reason);
-
-	public static implicit operator KcpSequenceSendResult(KcpSendResult value)
-	{
-		return new(value.SentCount ?? null, value.FailReason);
-	}
 }

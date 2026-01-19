@@ -59,7 +59,7 @@ namespace FaGe.Kcp
 		/// <summary>
 		/// 开始写入数据的偏移量
 		/// </summary>
-		public int WritingBeginOffset => Length + IKCP_OVERHEAD;
+		public int WriteBeginningOffset => Length + IKCP_OVERHEAD;
 		/// <summary>
 		/// 写入的数据长度
 		/// </summary>
@@ -85,7 +85,7 @@ namespace FaGe.Kcp
 		/// <summary>
 		/// Buffer剩余空间视图
 		/// </summary>
-		public Memory<byte> RemainingMemory => RentBuffer[WritingBeginOffset..];
+		public Memory<byte> RemainingMemory => RentBuffer[WriteBeginningOffset..];
 
 		/// <summary>
 		/// 全包视图
@@ -124,7 +124,7 @@ namespace FaGe.Kcp
 		public void Advance(uint count)
 		{
 			Debug.Assert(PayloadMemory.Length <= Length + count);
-			Advance(count);
+			Advance((int)count);
 		}
 
 		/// <summary>
@@ -166,9 +166,14 @@ namespace FaGe.Kcp
 				result.rentBuffer.EnsureCapacity(packetBuffer.Length);
 
 			packetBuffer.CopyTo(result.RentBuffer);
-			result.Length = packetBuffer.Length - IKCP_OVERHEAD;
-
 			result.ConvertHeaderToMachineEndian();
+			
+			result.Length = (int)result.HeaderRef.len;
+
+#if DEBUG
+			Debug.Assert(result.Length + IKCP_OVERHEAD == packetBuffer.Length, "Packet's lentgh is mismatch between machine and network representation.");
+#endif
+
 			return result;
 		}
 

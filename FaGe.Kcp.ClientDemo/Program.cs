@@ -1,5 +1,6 @@
 ﻿// See https://aka.ms/new-console-template for more information
 using FaGe.Kcp.Connections;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -26,28 +27,38 @@ void Console_CancelKeyPress(object? sender, ConsoleCancelEventArgs e)
 Memory<byte> sendBuffer = Encoding.UTF8.GetBytes("发送一条消息");
 
 
-var send = Task.Run(async () =>
+Task send = Task.Run(async () =>
 {
 	var ct = cts.Token;
 	while (!ct.IsCancellationRequested)
 	{
-		if (Console.ReadKey().Key == ConsoleKey.S)
+		try
 		{
-			// 发送数据
-			var result = await kcpConnection.SendAsync(sendBuffer, ct);
-			Console.WriteLine("Test FaGe.Kcp Message");
-			if (result.IsSucceed)
+			if (Console.ReadKey().Key == ConsoleKey.S)
 			{
-				var packet = await kcpConnection.ReceiveAsync(ct);
-				if (Utf8.IsValid(packet.Result.Buffer.FirstSpan))
+				// 发送数据
+				var result = await kcpConnection.SendAsync(sendBuffer, ct);
+				Console.WriteLine("Test FaGe.Kcp Message");
+				if (result.IsSucceed)
 				{
-					Console.WriteLine(Encoding.UTF8.GetString(packet.Result.Buffer.FirstSpan));
+					var packet = await kcpConnection.ReceiveAsync(ct);
+					if (Utf8.IsValid(packet.Result.Buffer.FirstSpan))
+					{
+						Console.WriteLine(Encoding.UTF8.GetString(packet.Result.Buffer.FirstSpan));
+					}
 				}
 			}
 		}
+		catch (Exception e)
+		{
+			Console.WriteLine("send error:");
+			Console.WriteLine(e);
+			cts.Cancel();
+			exceptionStopEvent.Set();
+		}
 	}
 });
-var update = Task.Run(async () =>
+Task update = Task.Run(async () =>
 {
 	var ct = cts.Token;
 	try
@@ -61,11 +72,29 @@ var update = Task.Run(async () =>
 	}
 	catch (Exception e)
 	{
-		Console.WriteLine("error:");
+		Console.WriteLine("update error:");
 		Console.WriteLine(e);
 		cts.Cancel();
 		exceptionStopEvent.Set();
 	}
 });
+Task receive = Task.Run(async () =>
+{
+	var ct = cts.Token;
+	while (!ct.IsCancellationRequested)
+	{
+		try
+		{
+			await kcpConnection.RunReceiveLoop(cts.Token);
+		}
+		catch (Exception e)
+		{
+			Console.WriteLine("receive error:");
+			Console.WriteLine(e);
+			cts.Cancel();
+			exceptionStopEvent.Set();
+		} 
+	}
+});
 
-await Task.WhenAll(send, update);
+await Task.WhenAll(send, update, receive);

@@ -1,6 +1,7 @@
-﻿using System.IO.Pipelines;
+﻿using FaGe.Kcp.Connections;
+using System.IO.Pipelines;
 
-namespace FaGe.Kcp.Connections;
+namespace FaGe.Kcp;
 
 #pragma warning disable IDE0250 // 将结构设置为 “readonly”
 public struct KcpApplicationPacket(ReadResult result, KcpConnectionBase source, int packetFragmentCount) : IDisposable
@@ -8,6 +9,7 @@ public struct KcpApplicationPacket(ReadResult result, KcpConnectionBase source, 
 {
 	public readonly ReadResult Result = result;
 	public readonly bool IsNotEmpty => source != null;
+	public readonly bool IsEmpty => source == null;
 
 	private KcpConnectionBase? source = source;
 	private readonly int packetFragmentsCount = packetFragmentCount;

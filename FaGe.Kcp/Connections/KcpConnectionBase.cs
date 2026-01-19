@@ -1,18 +1,30 @@
 ﻿using DanmakuR.Protocol.Buffer;
 using FaGe.Kcp.Utility;
-using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipelines;
-using System.Net.Sockets;
-using System.Runtime.CompilerServices;
-using System.Threading;
 using static FaGe.Kcp.KcpConst;
 
 namespace FaGe.Kcp.Connections;
 
-public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
+/// <summary>
+/// KCP 连接基类，封装了KCP协议的核心逻辑。该类型基本上并发不安全。
+/// </summary>
+/// <remarks>
+/// 以下方法并发不安全，调用方必须保证以非并发的方式调用它们。<br/>
+/// 包含<list type="bullet">
+/// <item>
+/// <description><see cref="Update(uint)"/>以及异步版本
+/// </description>
+/// </item>
+/// <item><description><see cref="FlushAsync(CancellationToken)"/></description></item>
+/// <item><description><see cref="QueueToSenderWithAsyncSource(ReadOnlyMemory{byte}, TaskCompletionSource?, CancellationToken)"/>以及受保护异步封装</description></item>
+/// <item><description><see cref="InputFromUnderlyingTransport(ReadOnlyMemory{byte})"/></description></item>
+/// <item><description><see cref="TryReadPacket(CancellationToken)"/>以及受保护异步封装</description></item>
+/// </list>
+/// </remarks>
+public abstract class KcpConnectionBase : IDisposable
 {
 	/// <summary>
 	/// 控制信号，输出用临时缓冲区
@@ -177,13 +189,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	public int ConnectionId => (int)conv;
 	public uint ConnectionIdUnsigned => conv;
 
-	// Pipe传输模式开的洞
-	//private readonly Pipe sendPipe = new();
-	//private readonly Pipe receivePipe = new();
-
-	//protected PipeReader ReceiveReader => receivePipe.Reader;
-	//protected PipeWriter SendWriter => sendPipe.Writer;
-
 	TaskCompletionSource? pendingReceiveTaskSource = null;
 
 	protected KcpConnectionBase(
@@ -195,6 +200,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		rcv_wnd = IKCP_WND_RCV;
 		rmt_wnd = IKCP_WND_RCV;
 		MTU = IKCP_MTU_DEF;
+		dead_link = IKCP_DEADLINK;
 
 		snd_buf = new();
 		rcv_queue = new();
@@ -243,6 +249,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				rcv_wnd = maxRcvWindow;
 		}
 	}
+
 	public int MaxUserTransferLength => (int)mss;
 
 	public int SendWindowSize
@@ -256,11 +263,11 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	}
 	public int RecvWindowSize
 	{
-		get => (int)snd_wnd;
+		get => (int)rcv_wnd;
 		set
 		{
 			ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, nameof(RecvWindowSize));
-			snd_wnd = (uint)value;
+			rcv_wnd = (uint)value;
 		}
 	}
 
@@ -289,15 +296,19 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	{
 		get
 		{
-			int waitCount = rcv_queue.Count;
+			UpdateWindowFullState();
 
-			if (waitCount < rcv_wnd)
-			{
-				var count = rcv_wnd - waitCount;
-				return (ushort)Math.Min(count, ushort.MaxValue);
-			}
+			if (IsWindowFull)
+				return 0;
 
-			return 0;
+			int waitCount = rcv_queue.Count + rcv_buf.Count;
+			uint effectiveWnd = Math.Min(rcv_wnd, maxRcvWindow);
+
+			if (waitCount >= effectiveWnd)
+				return 0;
+
+			var count = rcv_wnd - waitCount;
+			return (ushort)Math.Min(count, ushort.MaxValue);
 		}
 	}
 
@@ -526,16 +537,31 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 				if (TimeDiffSigned(header.sn, rcv_nxt + rcv_wnd) < 0)
 				{
-					acklist.Enqueue((header.sn, header.ts));
-
-					if (TimeDiffSigned(header.sn, rcv_nxt) >= 0)
+					if (!isWindowFull)
 					{
-						int packetLength = IKCP_OVERHEAD + (int)header.len;
-						var packet = PacketBuffer.FromNetwork(buffer[..packetLength], ArrayPool<byte>.Shared);
+						acklist.Enqueue((header.sn, header.ts));
 
-						buffer = buffer[packetLength..];
-						ParseData(packet);
+						if (TimeDiffSigned(header.sn, rcv_nxt) >= 0)
+						{
+							int packetLength = IKCP_OVERHEAD + (int)header.len;
+							var packet = PacketBuffer.FromNetwork(buffer[..packetLength], ArrayPool<byte>.Shared);
+
+							buffer = buffer[packetLength..];
+							ParseData(packet);
+						}
 					}
+					else
+					{
+						int packetTotalSize = IKCP_OVERHEAD + (int)header.len;
+						buffer = buffer[packetTotalSize..];
+						offset += packetTotalSize;
+						continue;
+					}
+				}
+				else
+				{
+					// 窗口外数据：仍发送ACK
+					acklist.Enqueue((header.sn, header.ts));
 				}
 			}
 			else if (header.cmd == KcpCommand.WindowProbe)
@@ -590,6 +616,24 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		return new(0);
 	}
 
+	/// <summary>
+	/// 更新窗口满状态
+	/// </summary>
+	private void UpdateWindowFullState()
+	{
+		uint totalPackets = (uint)(rcv_queue.Count + rcv_buf.Count);
+		uint effectiveWindow = Math.Min(rcv_wnd, maxRcvWindow);
+
+		bool newState = totalPackets >= effectiveWindow;
+
+		if (isWindowFull != newState)
+		{
+			isWindowFull = newState;
+			Trace.WriteLine($"[FaGe.KCP] 连接 {conv} 窗口状态变化: " +
+				$"{(newState ? "已满" : "有空闲")} ({totalPackets}/{effectiveWindow})");
+		}
+	}
+
 	private void ParseFastAck(uint sn, uint latest_ts)
 	{
 		if (TimeDiffSigned(sn, snd_una) < 0 || TimeDiffSigned(sn, snd_nxt) >= 0)
@@ -608,10 +652,10 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 #if !IKCP_FASTACK_CONSERVE
 				packet.PacketControlFields.fastack++;
 #else
-                    if (TimeDiffSigned(ts, seg.ts) >= 0)
-                    {
-                        packet.PacketControlFields.fastack++;
-                    }
+					if (TimeDiffSigned(ts, seg.ts) >= 0)
+					{
+						packet.PacketControlFields.fastack++;
+					}
 #endif
 			}
 		}
@@ -689,6 +733,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				break;
 			}
 		}
+		pendingReceiveTaskSource?.SetResult();
 	}
 
 	private void ParseAck(uint sn)
@@ -710,7 +755,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				{
 					// 通知SendAsync()该报文已送达，准备收回控制权
 					packet.AsyncState.TrySetResult();
-					packet.DisassociateAsyncState(); // 使该包与TCS不再关联，避免通知两次
+					packet.MarkPacketCompleted(); // 使该包与TCS不再关联，避免通知两次
 				}
 				packet.Dispose();
 				break;
@@ -775,7 +820,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				{
 					// 通知SendAsync()该报文已送达，准备收回控制权
 					packet.AsyncState.TrySetResult();
-					packet.DisassociateAsyncState(); // 使该包与TCS不再关联，避免通知两次
+					packet.MarkPacketCompleted(); // 使该包与TCS不再关联，避免通知两次
 				}
 				packet.Dispose();
 			}
@@ -863,13 +908,27 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 				throw ex;
 			}
 			var packet = rcv_queue.Dequeue();
+			UpdateWindowFullState();
 			packet.Dispose();
 		}
 	}
 	#endregion
 
 	#region 异步收发API
-
+	/// <summary>
+	/// 将指定的数据排入内部发送队列并返回表示发送结果的异步任务。
+	/// 若数据能够立即完成排队并且不存在需等待的异步发送任务，则返回已完成的 <see cref="ValueTask{KcpSendResult}"/>；
+	/// 否则返回一个在内部异步发送任务完成后产生最终 <see cref="KcpSendResult"/> 的 <see cref="ValueTask{KcpSendResult}"/>。
+	/// </summary>
+	/// <remarks>
+	/// 本方法为发送操作的基础实现：它不会直接执行网络 I/O，而是将数据封装并放入发送队列（由 <see cref="QueueToSenderWithAsyncSource(ReadOnlyMemory{byte}, TaskCompletionSource?, CancellationToken)"/> 处理）。
+	/// 返回的 <see cref="ValueTask{T}"/> 在到达发送缓冲区时完成。调用方应使用返回的结果判断实际发送状态。
+	/// 注意：FaGe.Kcp 的大部分实例方法并发不安全，调用方应保证对同一连接的调用为非并发的。
+	/// </remarks>
+	/// <param name="buffer">要发送的应用层数据（只读内存）。方法会将其分片并排入发送队列，传入的数据在调用后仍由调用方管理其生命周期。</param>
+	/// <param name="cancellationToken">用于取消等待发送完成的令牌。若在等待前或等待期间发生取消，将在放出控制权前抛出 <see cref="OperationCanceledException"/>，以避免潜在死锁。</param>
+	/// <returns>一个 <see cref="ValueTask{KcpSendResult}"/>，其结果包含已排队的字节数以及（可选的）表示实际发送完成的内部任务信息。</returns>
+	/// <exception cref="OperationCanceledException">当 <paramref name="cancellationToken"/> 在等待前或等待期间已取消时抛出。</exception>
 	protected ValueTask<KcpSendResult> SendAsyncBase(
 		ReadOnlyMemory<byte> buffer,
 		CancellationToken cancellationToken)
@@ -899,10 +958,19 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		}
 	}
 
+	/// <summary>
+	/// Asynchronously receives the next application-level packet from the connection.
+	/// </summary>
+	/// <remarks>If a packet is already available, the method returns it immediately. Otherwise, the returned task
+	/// completes when a new packet arrives or the operation is canceled. This method is intended for use by derived
+	/// classes to implement custom receive logic.</remarks>
+	/// <param name="cancellationToken">A cancellation token that can be used to cancel the receive operation.</param>
+	/// <returns>A value task that represents the asynchronous receive operation. The result contains the next available application
+	/// packet, or an empty packet if the connection is closed or no data is available.</returns>
 	protected ValueTask<KcpApplicationPacket> ReceiveAsyncBase(CancellationToken cancellationToken)
 	{
 		var appPacket = TryReadPacket(cancellationToken);
-		if (!appPacket.IsNotEmpty)
+		if (appPacket.IsNotEmpty)
 			return ValueTask.FromResult(appPacket);
 
 		TaskCompletionSource signalSource = new();
@@ -911,14 +979,19 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 		if (signal.IsCompleted)
 		{
+			pendingReceiveTaskSource = null;
 			return ValueTask.FromResult(TryReadPacket(cancellationToken));
 		}
 		else
 		{
-			static async ValueTask<KcpApplicationPacket> ReceiveAsyncCore(KcpApplicationPacket result, KcpConnectionBase kcp, TaskCompletionSource currentRecvSource, CancellationToken cancellationToken)
+			static async ValueTask<KcpApplicationPacket> ReceiveAsyncCore(KcpConnectionBase kcp, TaskCompletionSource currentRecvSource, CancellationToken cancellationToken)
 			{
 				// 若取消，放出控制权之前throw，避免死锁
 				cancellationToken.ThrowIfCancellationRequested();
+				cancellationToken.Register(() =>
+				{
+					currentRecvSource.TrySetCanceled(cancellationToken);
+				});
 
 				Debug.Assert(kcp.pendingReceiveTaskSource == currentRecvSource, "Race condition or internal bugs detected.");
 				if (kcp.pendingReceiveTaskSource != currentRecvSource)
@@ -934,12 +1007,13 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 					throw ex;
 				}
-				await currentRecvSource.Task;
 
-				return result;
+				await currentRecvSource.Task;
+				kcp.pendingReceiveTaskSource = null;
+				return kcp.TryReadPacket(default); // no cancellation here
 			}
 
-			return ReceiveAsyncCore(appPacket, this, signalSource, cancellationToken);
+			return ReceiveAsyncCore(this, signalSource, cancellationToken);
 		}
 	}
 
@@ -999,7 +1073,11 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			return FlushAsync(ct);
 	}
 
-	// ikcp_check
+	/// <summary>
+	/// ikcp_check
+	/// </summary>
+	/// <param name="nowMillisec"></param>
+	/// <returns></returns>
 	public uint GetWhenShouldUpdate(uint nowMillisec)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
@@ -1056,6 +1134,9 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 	public async ValueTask FlushAsync(CancellationToken ct)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+
+		// 确保窗口状态是最新的
+		UpdateWindowFullState();
 
 		// 我们很难在这里使用局部变量来创建临时缓冲区，因为源自stackalloc的内存必须在堆栈上分配，无法在异步点跨越堆栈边界。
 		// 因此，我们使用一个租赁的缓冲区来存储数据，直到调用输出回调。
@@ -1218,9 +1299,9 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		var rtomin = IsNoDelayMode ? (rx_rto >> 3) : 0;
 
 		// flush data segments
-		foreach (var item in snd_buf)
+		for (var node = snd_buf.First; node != null; node = node.Next)
 		{
-			var packet = item;
+			var packet = node.Value;
 			var needsend = false;
 
 			if (packet.PacketControlFields.xmit == 0)
@@ -1267,7 +1348,7 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 			if (needsend)
 			{
 				// 通知上层该报文将被发送（或重传）
-				packet.PacketCompleted?.SetResult();
+				packet.AsyncState?.SetResult();
 				packet.MarkPacketCompleted();
 
 				packet.HeaderRef = packet.HeaderRef with
@@ -1305,8 +1386,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 				if (packet.PacketControlFields.xmit >= dead_link)
 				{
-					state = -1;
-
 					Dispose();
 					// TODO 用EventSource改写
 					//if (CanLog(KcpLogMask.IKCP_LOG_DEAD_LINK))
@@ -1377,28 +1456,28 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		foreach (var packet in snd_buf)
 		{
 			packet.DisposeCts?.Cancel();
-			packet.DisassociateAsyncState();
+			packet.MarkPacketCompleted();
 		}
 		snd_buf.Clear();
-        foreach (var packet in snd_queue)
+		foreach (var packet in snd_queue)
 		{
 			packet.DisposeCts?.Cancel();
-			packet.DisassociateAsyncState();
+			packet.MarkPacketCompleted();
 		}
 		snd_queue.Clear();
-        foreach (var packet in rcv_buf)
+		foreach (var packet in rcv_buf)
 		{
 			packet.DisposeCts?.Cancel();
-			packet.DisassociateAsyncState();
+			packet.MarkPacketCompleted();
 		}
 		rcv_buf.Clear();
-        foreach (var packet in rcv_queue)
+		foreach (var packet in rcv_queue)
 		{
 			packet.DisposeCts?.Cancel();
-			packet.DisassociateAsyncState();
+			packet.MarkPacketCompleted();
 		}
 		rcv_queue.Clear();
-    }
+	}
 
 	/// <summary>
 	/// 获取将要接收的下一个消息的总长度（包括分包拼接后的长度）。如果没有完整的消息可供接收，则返回-1。
@@ -1435,6 +1514,13 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 		return length;
 	}
+
+	/// <summary>
+	/// 
+	/// </summary>
+	/// <param name="msecLater"></param>
+	/// <param name="msecEarlier"></param>
+	/// <returns></returns>
 	protected static int TimeDiffSigned(uint msecLater, uint msecEarlier)
 	{
 		return (int)(msecLater - msecEarlier);
@@ -1491,6 +1577,10 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		NoCwnd = nc;
 	}
 
+	/// <summary>
+	/// 
+	/// </summary>
+	/// <param name="disposing"></param>
 	protected virtual void Dispose(bool disposing)
 	{
 		if (!disposedValue)
@@ -1503,13 +1593,6 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 
 			disposedValue = true;
 		}
-	}
-
-	public async ValueTask DisposeAsync()
-	{
-		disposedValue = true;
-		CancelAllPendingAsyncOperations();
-		DisposeBuffers();
 	}
 
 	private void DisposeBuffers()
@@ -1533,6 +1616,9 @@ public abstract class KcpConnectionBase : IDisposable, IAsyncDisposable
 		recycledBuffers.Clear();
 	}
 
+	/// <summary>
+	/// 
+	/// </summary>
 	public void Dispose()
 	{
 		// 不要更改此代码。请将清理代码放入“Dispose(bool disposing)”方法中

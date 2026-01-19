@@ -74,7 +74,7 @@ public struct KcpPacketHeader(KcpPacketHeaderAnyEndian anyEndian, bool isTranspo
 
 		if (data.Length >= dstSpan.Length)
 		{
-			data[dstSpan.Length..].CopyTo(dstSpan);
+			data[..dstSpan.Length].CopyTo(dstSpan);
 			header = new(headerAnyEndian.ReverseEndianness(), false);
 			return true;
 		}
