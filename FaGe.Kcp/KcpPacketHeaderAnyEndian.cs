@@ -76,7 +76,7 @@ public struct KcpPacketHeaderAnyEndian
 		result.ts = BinaryPrimitives.ReverseEndianness(ts);
 		result.sn = BinaryPrimitives.ReverseEndianness(sn);
 		result.una = BinaryPrimitives.ReverseEndianness(una);
-		result.sn = BinaryPrimitives.ReverseEndianness(sn);
+		result.len = BinaryPrimitives.ReverseEndianness(len);
 
 		return result;
 	}
