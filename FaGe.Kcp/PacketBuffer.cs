@@ -1,6 +1,8 @@
 ﻿using FaGe.Kcp.Utility;
 using System.Buffers;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using static FaGe.Kcp.KcpConst;
@@ -12,8 +14,8 @@ namespace FaGe.Kcp
 				: IDisposable
 	{
 		private RentBuffer rentBuffer = new(expectedCapacity + IKCP_OVERHEAD, bufferSource);
-		
-		internal TaskCompletionSource? AsyncState { get; private set; }
+
+		private TaskCompletionSource? AsyncState { get; set; }
 
 		internal CancellationTokenSource? DisposeCts { get; private set; }
 
@@ -21,11 +23,13 @@ namespace FaGe.Kcp
 		{
 			AsyncState = tcs;
 			DisposeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-			DisposeCts.Token.Register(() =>
-			{
-				AsyncState.TrySetCanceled(DisposeCts.Token);
-				Dispose();
-			});
+			DisposeCts.Token.Register(OnLinkedCancel);
+		}
+
+		private void OnLinkedCancel()
+		{
+			AsyncState!.TrySetCanceled(DisposeCts!.Token);
+			Dispose();
 		}
 
 		internal void MarkPacketCompleted()
@@ -71,6 +75,7 @@ namespace FaGe.Kcp
 		/// 控制字
 		/// </summary>
 		public PacketControlFields PacketControlFields = default;
+		private bool disposedValue;
 
 		/// <summary>
 		/// KCP包头内容
@@ -99,8 +104,8 @@ namespace FaGe.Kcp
 			if (!IsMachineEndian && !BitConverter.IsLittleEndian) // 改大端要改这里
 			{
 				HeaderRef = HeaderRef.ReverseEndianness();
-				IsMachineEndian = true;
 			}
+			IsMachineEndian = true;
 		}
 
 		public void ConvertHeaderToNetworkEndian()
@@ -167,7 +172,7 @@ namespace FaGe.Kcp
 
 			packetBuffer.CopyTo(result.RentBuffer);
 			result.ConvertHeaderToMachineEndian();
-			
+
 			result.Length = (int)result.HeaderRef.len;
 
 #if DEBUG
@@ -179,8 +184,119 @@ namespace FaGe.Kcp
 
 		public void Dispose()
 		{
+			disposedValue = true;
 			DisposeCts?.Cancel();
 			rentBuffer.Dispose();
+		}
+
+		internal void SetAsnycCompleted()
+		{
+			ObjectDisposedException.ThrowIf(disposedValue, this);
+			AsyncState?.SetResult();
+			MarkPacketCompleted();
+		}
+
+		internal void SetAsnycCanceled(CancellationToken ct)
+		{
+			ObjectDisposedException.ThrowIf(disposedValue, this);
+			AsyncState?.SetCanceled(ct);
+			MarkPacketCompleted();
+		}
+
+		internal void SetAsnycComplete(Exception ex)
+		{
+			ObjectDisposedException.ThrowIf(disposedValue, this);
+			AsyncState?.SetException(ex);
+			MarkPacketCompleted();
+		}
+
+		internal struct FlushPacketBuffer : IDisposable
+		{
+			private PacketBuffer? packetBuffer;
+
+			internal FlushPacketBuffer(ArrayPool<byte> bufferSource, int expectedCapacity)
+			{
+				packetBuffer = new PacketBuffer(bufferSource, expectedCapacity, true);
+			}
+
+			[MemberNotNull(nameof(packetBuffer))]
+			private void CheckDisposed()
+			{
+				ObjectDisposedException.ThrowIf(packetBuffer == null || packetBuffer.disposedValue, typeof(FlushPacketBuffer));
+			}
+
+			public void Clear()
+			{
+				CheckDisposed();
+				packetBuffer.Length = 0;
+			}
+
+			public void EnsureCapacity(int sizeHint)
+			{
+				CheckDisposed();
+				packetBuffer.RentBufferFromPool(sizeHint);
+			}
+
+			public Memory<byte> EncodedPacketsMemory
+			{
+				get
+				{
+					CheckDisposed();
+					// 包都存储在payload部分，header部分不使用
+					return packetBuffer.PayloadMemory;
+				}
+			}
+
+			private Span<KcpPacketHeaderAnyEndian> DebugEncodedSmallPacketsSpan
+			{
+				get
+				{
+					CheckDisposed();
+					return MemoryMarshal.Cast<byte, KcpPacketHeaderAnyEndian>(packetBuffer.PayloadMemory.Span);
+				}
+			}
+
+			/// <summary>
+			/// 
+			/// </summary>
+			/// <param name="headerOnlyPacket"></param>
+			/// <exception cref="InvalidOperationException">缓冲区大小不足</exception>
+			public bool TryWriteHeaderOnlyPacket(KcpPacketHeaderAnyEndian headerOnlyPacket)
+			{
+				CheckDisposed();
+				
+				var encodingSpan = packetBuffer.RemainingMemory.Span;
+				bool succeed = KcpPacketHeaderAnyEndian.Encode(headerOnlyPacket, ref encodingSpan);
+				
+				if (succeed)
+					packetBuffer.Advance(IKCP_OVERHEAD);
+
+				return succeed;
+			}
+
+			public bool TryWritePacket(PacketBuffer sourcePacket)
+			{
+				CheckDisposed();
+				var encodingSpan = packetBuffer.RemainingMemory.Span;
+				bool succeed = sourcePacket.Encode(ref encodingSpan, out int encodedLength) == OperationStatus.Done;
+				if (succeed)
+					packetBuffer.Advance(encodedLength);
+				return succeed;
+			}
+
+			public void Dispose()
+			{
+				if (packetBuffer != null)
+				{
+					packetBuffer.Dispose();
+					packetBuffer = null!;
+				}
+			}
+
+			internal void Reset()
+			{
+				packetBuffer.Length = 0;
+			}
 		}
 	}
 

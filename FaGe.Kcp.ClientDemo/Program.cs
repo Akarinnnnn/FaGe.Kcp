@@ -12,7 +12,7 @@ var remoteEp = new IPEndPoint(IPAddress.Loopback, 40001);
 KcpConnection kcpConnection = new KcpConnection(designatedClient, 2001, remoteEp);
 
 CancellationTokenSource cts = new CancellationTokenSource();
-ManualResetEventSlim exceptionStopEvent = new(false);
+Barrier exceptionExitBarrier = new(4);
 
 Console.CancelKeyPress += Console_CancelKeyPress;
 
@@ -21,7 +21,7 @@ void Console_CancelKeyPress(object? sender, ConsoleCancelEventArgs e)
 {
 	cts.Cancel();
 	kcpConnection.Dispose();
-	exceptionStopEvent.Wait();
+	exceptionExitBarrier.SignalAndWait();
 }
 
 Memory<byte> sendBuffer = Encoding.UTF8.GetBytes("发送一条消息");
@@ -34,7 +34,7 @@ Task send = Task.Run(async () =>
 	{
 		try
 		{
-			if (Console.ReadKey().Key == ConsoleKey.S)
+			if (Console.KeyAvailable && Console.ReadKey().Key == ConsoleKey.S)
 			{
 				// 发送数据
 				var result = await kcpConnection.SendAsync(sendBuffer, ct);
@@ -54,7 +54,7 @@ Task send = Task.Run(async () =>
 			Console.WriteLine("send error:");
 			Console.WriteLine(e);
 			cts.Cancel();
-			exceptionStopEvent.Set();
+			exceptionExitBarrier.RemoveParticipant();
 		}
 	}
 });
@@ -75,7 +75,7 @@ Task update = Task.Run(async () =>
 		Console.WriteLine("update error:");
 		Console.WriteLine(e);
 		cts.Cancel();
-		exceptionStopEvent.Set();
+		exceptionExitBarrier.RemoveParticipant();
 	}
 });
 Task receive = Task.Run(async () =>
@@ -92,8 +92,8 @@ Task receive = Task.Run(async () =>
 			Console.WriteLine("receive error:");
 			Console.WriteLine(e);
 			cts.Cancel();
-			exceptionStopEvent.Set();
-		} 
+			exceptionExitBarrier.RemoveParticipant();
+		}
 	}
 });
 

@@ -37,7 +37,7 @@ public struct KcpPacketHeader(KcpPacketHeaderAnyEndian anyEndian, bool isTranspo
 			if (!IsMachineEndian && !BitConverter.IsLittleEndian) // 改大端要改这里
 			{
 				var transportEndian = ValueAnyEndian;
-				return new(transportEndian.ReverseEndianness(), true);
+				return new(transportEndian.ReverseEndianness(), false);
 			}
 			else
 			{

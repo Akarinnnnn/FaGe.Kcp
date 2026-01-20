@@ -1,4 +1,5 @@
-﻿using System.Buffers;
+﻿using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -95,7 +96,24 @@ public struct KcpPacketHeaderAnyEndian
 		if (headerAnyEndian is null)
 			return null;
 
-		var header = new KcpPacketHeader(headerAnyEndian.Value.ReverseEndianness(), false);
-		return header;
+		var header = new KcpPacketHeader(headerAnyEndian.Value, true);
+		return header.MachineForm;
+	}
+
+	internal static bool Encode(KcpPacketHeaderAnyEndian headerOnlyPacket, ref Span<byte> encodingSpan)
+	{
+		if (encodingSpan.Length < ExpectedSize)
+			return false;
+
+#if DEBUG && !UNITY
+		unsafe
+		{
+			var ptr = (byte*)Unsafe.AsPointer(ref encodingSpan.GetPinnableReference());
+			Debug.Assert((((nuint)ptr) & 0b0000_0011) == 0, "Attempt to do an write on unaligned address.");
+		}
+#endif
+
+		Unsafe.As<byte, KcpPacketHeaderAnyEndian>(ref encodingSpan.GetPinnableReference()) = headerOnlyPacket;
+		return true;
 	}
 }

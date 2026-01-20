@@ -172,7 +172,7 @@ public abstract class KcpConnectionBase : IDisposable
 	// 现在暂时用不上，哪天我想用了再说
 	private readonly Stack<PacketBuffer> recycledBuffers = new();
 
-	private RentBuffer ackFlushBuffer;
+	private PacketBuffer.FlushPacketBuffer flushBuffer;
 
 	private bool disposedValue;
 
@@ -182,7 +182,7 @@ public abstract class KcpConnectionBase : IDisposable
 	[Obsolete]
 	private int stream => IsStreamMode ? 1 : 0;
 
-	private int ThreeMtuPacketBufferSize => (int)(3 * (MTU + IKCP_OVERHEAD));
+	private int ControlPacketBufferSize => (int)(mtu % IKCP_OVERHEAD * IKCP_OVERHEAD);
 
 #pragma warning restore
 
@@ -205,7 +205,7 @@ public abstract class KcpConnectionBase : IDisposable
 		snd_buf = new();
 		rcv_queue = new();
 
-		ackFlushBuffer = new(ThreeMtuPacketBufferSize, AckOutputTemporaryBufferPool);
+		flushBuffer = new(AckOutputTemporaryBufferPool, ControlPacketBufferSize);
 	}
 
 	public event Action? OnConnectionWasClosed;
@@ -228,7 +228,7 @@ public abstract class KcpConnectionBase : IDisposable
 
 			mtu = newmtu;
 			mss = newmss;
-			ackFlushBuffer = new(ThreeMtuPacketBufferSize, AckOutputTemporaryBufferPool);
+			flushBuffer = new(AckOutputTemporaryBufferPool, ControlPacketBufferSize);
 		}
 	}
 
@@ -458,6 +458,11 @@ public abstract class KcpConnectionBase : IDisposable
 
 	#region 从底层传输输入数据
 	// 我觉得接收时不会有ReadOnlySequence传进来的情况，毕竟不是PipeReader读取，而是DatagramSocket接收数据。实在有那就让他循环调用。
+	/// <summary>
+	/// 从底层传输输入数据
+	/// </summary>
+	/// <param name="buffer">底层传输处获得的KCP数据流</param>
+	/// <returns>输入结果，包含接受的数据长度。若没有全部接受，可能需要缓存数据。</returns>
 	protected KcpInputResult InputFromUnderlyingTransport(ReadOnlyMemory<byte> buffer)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
@@ -479,18 +484,20 @@ public abstract class KcpConnectionBase : IDisposable
 			if (buffer.Length - offset < IKCP_OVERHEAD)
 				break;
 
-			if (KcpPacketHeader.TryRead(buffer.Span, out var headerDecoded))
+			KcpPacketHeader? headerSafe = KcpPacketHeaderAnyEndian.DecodeToMachineForm(buffer.Span);
+
+			if (headerSafe is null)
 			{
 				return new(-1);
 			}
 
-			KcpPacketHeaderAnyEndian header = headerDecoded.ValueAnyEndian;
+			KcpPacketHeaderAnyEndian header = headerSafe.Value.ValueAnyEndian;
 			// var dataBuffer = buffer.Slice(offset); 交给下面
 
 			if (header.conv != conv)
 				return new(-1);
 
-			if (buffer.Length < header.len)
+			if (buffer.Length < header.len + IKCP_OVERHEAD)
 				return new(-3);
 
 			switch (header.cmd)
@@ -578,7 +585,7 @@ public abstract class KcpConnectionBase : IDisposable
 				return new(-3);
 			}
 
-			offset += (int)header.len;
+			offset += (int)header.len + IKCP_OVERHEAD;
 		}
 
 		if (anyAckReceived != 0)
@@ -751,12 +758,8 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				snd_buf.Remove(p);
 
-				if (packet.AsyncState is not null)
-				{
-					// 通知SendAsync()该报文已送达，准备收回控制权
-					packet.AsyncState.TrySetResult();
-					packet.MarkPacketCompleted(); // 使该包与TCS不再关联，避免通知两次
-				}
+				// 通知SendAsync()该报文已送达，准备收回控制权
+				packet.SetAsnycCompleted();
 				packet.Dispose();
 				break;
 			}
@@ -816,12 +819,7 @@ public abstract class KcpConnectionBase : IDisposable
 			{
 				snd_buf.Remove(p);
 
-				if (packet.AsyncState is not null)
-				{
-					// 通知SendAsync()该报文已送达，准备收回控制权
-					packet.AsyncState.TrySetResult();
-					packet.MarkPacketCompleted(); // 使该包与TCS不再关联，避免通知两次
-				}
+				packet.SetAsnycCompleted();
 				packet.Dispose();
 			}
 			else
@@ -1161,30 +1159,29 @@ public abstract class KcpConnectionBase : IDisposable
 			ts = 0
 		});
 
-		// 发送ACK包
+		// 发送控制包
 		// 估测将使用3个包大小的buffer
-		ackFlushBuffer.EnsureCapacity(ThreeMtuPacketBufferSize);
-
-		Memory<byte> genericEncodingBuffer = ackFlushBuffer.Memory;
-		Memory<byte> currentEncodingBuffer = genericEncodingBuffer;
+		flushBuffer.EnsureCapacity(ControlPacketBufferSize);
 
 		while (acklist.TryDequeue(out var ack))
 		{
-			// 检查是否有足够空间写入ACK包
-			int size = GetEncodedBufferLength(genericEncodingBuffer, currentEncodingBuffer);
-			if (size + IKCP_OVERHEAD > MTU)
+			KcpPacketHeaderAnyEndian ackHeader = genericHeader.ValueAnyEndian with { sn = ack.sn, ts = ack.ts };
+
+			if (flushBuffer.EncodedPacketsMemory.Length + IKCP_OVERHEAD > MTU)
 			{
-				// 已编码的ACK数量超过临时buffer容量，调用输出回调
-				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
-				await InvokeOutputCallbackAsync(encodedBuffer, ct);
-				currentEncodingBuffer = genericEncodingBuffer;
+				// 已编码+当前的ACK数量超过MTU，调用输出回调
+				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				flushBuffer.Reset();
 			}
 
-			var ackHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { sn = ack.sn, ts = ack.ts });
-
-			var encodeSpan = currentEncodingBuffer.Span;
-			ackHeader.Write(ref encodeSpan);
-			currentEncodingBuffer = currentEncodingBuffer[(currentEncodingBuffer.Length - encodeSpan.Length)..];
+			if (!flushBuffer.TryWriteHeaderOnlyPacket(ackHeader))
+			{
+				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				flushBuffer.Reset();
+				bool result = flushBuffer.TryWriteHeaderOnlyPacket(ackHeader);
+				Debug.Assert(result, "无法写入ACK包到空的flushBuffer中，内部bug或设置不当？");
+				throw new ArgumentException("无法写入ACK包到空的flushBuffer中，可能是MTU,MSS设置过小。", nameof(MTU));
+			}
 		}
 
 		// 如果远端窗口大小为0，则探测接收窗口
@@ -1223,35 +1220,46 @@ public abstract class KcpConnectionBase : IDisposable
 		// 发送探测包（探测远端窗口大小）
 		if ((probe & AskType.Send) == AskType.Send)
 		{
-			int size = genericEncodingBuffer.Length - currentEncodingBuffer.Length;
-			if (size + IKCP_OVERHEAD > MTU)
+			KcpPacketHeaderAnyEndian probeSendHeader = genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowProbe };
+
+			if (flushBuffer.EncodedPacketsMemory.Length + IKCP_OVERHEAD > MTU)
 			{
-				// 已编码的指令数量超过临时buffer容量，调用输出回调
-				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
-				await InvokeOutputCallbackAsync(encodedBuffer, ct);
-				currentEncodingBuffer = genericEncodingBuffer;
+				// 已编码+当前的ACK数量超过MTU，调用输出回调
+				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				flushBuffer.Reset();
 			}
-			var probeHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowProbe });
-			var encodeSpan = currentEncodingBuffer.Span;
-			probeHeader.Write(ref encodeSpan);
-			currentEncodingBuffer = currentEncodingBuffer[..(currentEncodingBuffer.Length - encodeSpan.Length)];
+
+			if (!flushBuffer.TryWriteHeaderOnlyPacket(probeSendHeader))
+			{
+				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				flushBuffer.Reset();
+				bool result = flushBuffer.TryWriteHeaderOnlyPacket(probeSendHeader);
+				Debug.Assert(result, "无法写入PROBE包到空的flushBuffer中，内部bug或设置不当？");
+				throw new ArgumentException("无法写入PROBE包到空的flushBuffer中，可能是MTU,MSS设置过小。", nameof(MTU));
+			}
 		}
 
 		// 发送探测包（通知远端我们的窗口大小）
 		if ((probe & AskType.Tell) == AskType.Tell)
 		{
-			int size = GetEncodedBufferLength(genericEncodingBuffer, currentEncodingBuffer);
-			if (size + IKCP_OVERHEAD > MTU)
+			KcpPacketHeaderAnyEndian probeTellHeader = genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowSizeTell };
+
+			if (flushBuffer.EncodedPacketsMemory.Length + IKCP_OVERHEAD > MTU)
 			{
-				// 已编码的指令数量超过临时buffer容量，调用输出回调
-				ReadOnlyMemory<byte> encodedBuffer = currentEncodingBuffer[..size];
-				await InvokeOutputCallbackAsync(encodedBuffer, ct);
-				currentEncodingBuffer = genericEncodingBuffer;
+				// 已编码+当前的ACK数量超过MTU，调用输出回调
+				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				flushBuffer.Reset();
 			}
-			var probeHeader = KcpPacketHeader.FromMachine(genericHeader.ValueAnyEndian with { cmd = KcpCommand.WindowSizeTell });
-			var encodeSpan = currentEncodingBuffer.Span;
-			probeHeader.Write(ref encodeSpan);
-			currentEncodingBuffer = currentEncodingBuffer[..(currentEncodingBuffer.Length - encodeSpan.Length)];
+
+			if (!flushBuffer.TryWriteHeaderOnlyPacket(probeTellHeader))
+			{
+				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				flushBuffer.Reset();
+				bool result = flushBuffer.TryWriteHeaderOnlyPacket(probeTellHeader);
+				Debug.Assert(result, "无法写入PROBE包到空的flushBuffer中，内部bug或设置不当？");
+				throw new ArgumentException("无法写入PROBE包到空的flushBuffer中，可能是MTU,MSS设置过小。", nameof(MTU));
+			}
+
 		}
 
 		probe = AskType.None;
@@ -1261,6 +1269,9 @@ public abstract class KcpConnectionBase : IDisposable
 		{
 			cwndLocal = Math.Min(cwnd, cwndLocal);
 		}
+
+		await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+		flushBuffer.Reset();
 
 		// 将数据包从发送队列移动到发送缓冲区
 		// 这里没有涉及IO操作，因此可以同步执行
@@ -1348,7 +1359,12 @@ public abstract class KcpConnectionBase : IDisposable
 			if (needsend)
 			{
 				// 通知上层该报文将被发送（或重传）
-				packet.AsyncState?.SetResult();
+				if (ct.IsCancellationRequested)
+				{
+					packet.SetAsnycCanceled(ct);
+					throw new OperationCanceledException("FlushAsync was canceled.", ct);
+				}
+				packet.SetAsnycCompleted();
 				packet.MarkPacketCompleted();
 
 				packet.HeaderRef = packet.HeaderRef with
@@ -1360,22 +1376,18 @@ public abstract class KcpConnectionBase : IDisposable
 
 				var need = IKCP_OVERHEAD + packet.Length;
 				// using RentBuffer buffer = new((int)MTU + IKCP_OVERHEAD, ArrayPool<byte>.Shared);
-				int size = GetEncodedBufferLength(genericEncodingBuffer, currentEncodingBuffer);
-				if (need > MTU)
+				int size = flushBuffer.EncodedPacketsMemory.Length;
+				if (size + need > MTU)
 				{
-					await InvokeOutputCallbackAsync(currentEncodingBuffer, ct);
-					currentEncodingBuffer = genericEncodingBuffer;
+					await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+					flushBuffer.Reset();
 				}
 
 				// offset += segment.Encode(buffer.Memory.Span.Slice(offset));
-				var span = currentEncodingBuffer.Span;
-				if (packet.Encode(ref span, out int encodedLength) == OperationStatus.Done)
+				
+				if (!flushBuffer.TryWritePacket(packet))
 				{
-					currentEncodingBuffer = currentEncodingBuffer[encodedLength..];
-				}
-				else
-				{
-					// TODO Log
+					// ETW LOG
 				}
 
 				// TODO 用EventSource改写
@@ -1394,60 +1406,49 @@ public abstract class KcpConnectionBase : IDisposable
 					//}
 				}
 			}
-
-			// flash remain segments
-			int encodedBufferLen = GetEncodedBufferLength(genericEncodingBuffer, currentEncodingBuffer);
-			if (encodedBufferLen > 0)
-			{
-				// 已编码的包数量超过临时buffer容量，调用输出回调
-				ReadOnlyMemory<byte> encodedBuffer = genericEncodingBuffer[..encodedBufferLen];
-				await InvokeOutputCallbackAsync(encodedBuffer, ct);
-				currentEncodingBuffer = genericEncodingBuffer;
-			}
-
-			#region update ssthresh
-			// update ssthresh 根据丢包情况计算 ssthresh 和 cwnd.
-			if (change != 0)
-			{
-				var inflight = snd_nxt - snd_una;
-				ssthresh = inflight / 2;
-				if (ssthresh < IKCP_THRESH_MIN)
-				{
-					ssthresh = IKCP_THRESH_MIN;
-				}
-
-				cwnd = ssthresh + resent;
-				incr = cwnd * mss;
-			}
-
-			if (lost)
-			{
-				ssthresh = cwnd / 2;
-				if (ssthresh < IKCP_THRESH_MIN)
-				{
-					ssthresh = IKCP_THRESH_MIN;
-				}
-
-				cwnd = 1;
-				incr = mss;
-			}
-
-			if (cwnd < 1)
-			{
-				cwnd = 1;
-				incr = mss;
-			}
-			#endregion
-
-			if (IsDisposed)
-			{
-				InvokeOnConnectionWasClosed();
-			}
 		}
 
-		static int GetEncodedBufferLength(ReadOnlyMemory<byte> all, ReadOnlyMemory<byte> remaining)
+		// flash remain segments
+		await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+		flushBuffer.Reset();
+
+		#region update ssthresh
+		// update ssthresh 根据丢包情况计算 ssthresh 和 cwnd.
+		if (change != 0)
 		{
-			return all.Length - remaining.Length;
+			var inflight = snd_nxt - snd_una;
+			ssthresh = inflight / 2;
+			if (ssthresh < IKCP_THRESH_MIN)
+			{
+				ssthresh = IKCP_THRESH_MIN;
+			}
+
+			cwnd = ssthresh + resent;
+			incr = cwnd * mss;
+		}
+
+		if (lost)
+		{
+			ssthresh = cwnd / 2;
+			if (ssthresh < IKCP_THRESH_MIN)
+			{
+				ssthresh = IKCP_THRESH_MIN;
+			}
+
+			cwnd = 1;
+			incr = mss;
+		}
+
+		if (cwnd < 1)
+		{
+			cwnd = 1;
+			incr = mss;
+		}
+		#endregion
+
+		if (IsDisposed)
+		{
+			InvokeOnConnectionWasClosed();
 		}
 	}
 
@@ -1597,7 +1598,7 @@ public abstract class KcpConnectionBase : IDisposable
 
 	private void DisposeBuffers()
 	{
-		ackFlushBuffer.Dispose();
+		flushBuffer.Dispose();
 		foreach (var packet in snd_buf)
 			packet.Dispose();
 		foreach (var packet in snd_queue)

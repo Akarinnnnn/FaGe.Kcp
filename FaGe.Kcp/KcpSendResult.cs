@@ -3,16 +3,6 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace FaGe.Kcp;
 
-public readonly record struct KcpSequenceSendResult(long? SentCount, KcpSendStatus FailReasoon)
-{
-	[MemberNotNullWhen(true, nameof(SentCount))]
-	public bool IsSucceed => FailReasoon == KcpSendStatus.Succeed;
-
-	public static KcpSequenceSendResult Succeed(long sentCount) => new(sentCount, KcpSendStatus.Succeed);
-	public static KcpSequenceSendResult Fail(KcpSendStatus reason) => new(null, reason);
-
-}
-
 public readonly record struct KcpSendResult(int? SentCount, KcpSendStatus FailReason)
 {
 	[MemberNotNullWhen(true, nameof(SentCount))]
