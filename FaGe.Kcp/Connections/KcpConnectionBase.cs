@@ -495,10 +495,10 @@ public abstract class KcpConnectionBase : IDisposable
 			// var dataBuffer = buffer.Slice(offset); 交给下面
 
 			if (header.conv != conv)
-				return new(-1);
+				return new(-2);
 
 			if (buffer.Length < header.len + IKCP_OVERHEAD)
-				return new(-3);
+				return new(-1);
 
 			switch (header.cmd)
 			{
