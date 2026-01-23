@@ -1,3 +1,5 @@
+好的，明白了。那么我来帮您整合这些改进建议，更新README文档。以下是整合后的版本：
+
 # FaGe.Kcp
 
 FaGe.Kcp 是一个基于 KCP 协议实现库，专注于简化 KCP 协议在 .NET 环境下的使用，提供原生的连接管理、数据包收发、资源自动释放等核心能力。此外，还提供了原生异步收发API(async-await模式)。
@@ -37,14 +39,40 @@ LogPerformance(localTimestamp);
   - [架构分层](#架构分层)
   - [关键设计决策](#关键设计决策)
   - [配置选项](#配置选项)
+- [并发安全性](#并发安全性)
+  - [线程安全级别](#线程安全级别)
+  - [推荐的使用模式](#推荐的使用模式)
+  - [InputOnce() 的重要特性](#inputonce-的重要特性)
+  - [已知的竞争条件](#已知的竞争条件)
+  - [异常处理原则](#异常处理原则)
+  - [性能与安全权衡](#性能与安全权衡)
+  - [最佳实践总结](#最佳实践总结)
 - [故障排除](#故障排除)
-  - [常见问题](#常见问题)
-  - [性能调优](#性能调优)
+  - [并发相关问题](#并发相关问题)
+  - [性能相关问题](#性能相关问题)
+  - [网络相关问题](#网络相关问题)
+  - [调试建议](#调试建议)
+  - [常见错误代码](#常见错误代码)
+  - [预防措施](#预防措施)
 - [服务端使用提示](#服务端使用提示)
+  - [连接管理建议](#连接管理建议)
+  - [服务端架构选项](#服务端架构选项)
+  - [注意事项](#注意事项)
 - [进阶用法](#进阶用法)
   - [自定义传输层](#自定义传输层)
+- [从其他KCP实现迁移](#从其他kcp实现迁移)
+  - [主要区别](#主要区别)
+  - [常见迁移问题](#常见迁移问题)
+- [限制和注意事项](#限制和注意事项)
+  - [已知限制](#已知限制)
+  - [平台特定行为](#平台特定行为)
+  - [性能特性](#性能特性)
 - [资源释放](#资源释放)
 - [主要API参考](#主要api参考)
+  - [KcpConnection 主要方法](#kcpconnection-主要方法)
+  - [KcpConnection 主要属性](#kcpconnection-主要属性)
+  - [KcpApplicationPacket 主要成员](#kcpapplicationpacket-主要成员)
+  - [KcpConnection 线程安全级别](#kcpconnection-线程安全级别)
 - [许可证](#许可证)
 
 ## 快速开始
@@ -66,78 +94,209 @@ async Task RunKcpExampleAsync(CancellationToken ct)
     
     var connection = new KcpConnection(udpClient, conv, server);
     
-    // 并行启动所有任务
-    var tasks = new[]
-    {
-        connection.RunReceiveLoop(ct),
-        RunUpdateLoop(connection, ct),
-        RunSendLoop(connection, ct),
-        RunReceiveLoop(connection, ct)
-    };
+    // 使用Channel进行线程安全的发送
+    var sendChannel = System.Threading.Channels.Channel.CreateUnbounded<byte[]>();
     
-    await Task.WhenAll(tasks);
+    // 启动两个并行的任务
+    var workerTask = KcpWorkerAsync(connection, sendChannel, ct);
+    var sendProducerTask = SendProducerAsync(sendChannel, ct);
+    
+    // 等待任务完成
+    await Task.WhenAll(workerTask, sendProducerTask);
 }
 
-async Task RunUpdateLoop(KcpConnection connection, CancellationToken ct)
+// KCP工作器：处理所有KCP相关操作（单线程执行）
+async Task KcpWorkerAsync(
+    KcpConnection connection,
+    System.Threading.Channels.Channel<byte[]> sendChannel,
+    CancellationToken ct)
 {
+    Task udpReceiveTask = null;
+    
     while (!ct.IsCancellationRequested)
     {
-        // ✅ 重要：KCP协议需要UTC时间戳，确保网络两端时间可比
-        // 不要使用 Environment.TickCount64（不同机器启动时间不同）
-        uint timestamp = (uint)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        await connection.UpdateAsync(timestamp, ct);
-        await Task.Delay(10, ct);
+        try
+        {
+            // --- 阶段1：UDP输入处理 ---
+            if (udpReceiveTask?.IsCompleted == true)
+            {
+                await udpReceiveTask.ConfigureAwait(false); // 处理到达的数据
+                udpReceiveTask = null;
+            }
+            
+            if (udpReceiveTask == null)
+            {
+                // 启动新的非阻塞接收
+                udpReceiveTask = connection.InputOnce(ct);
+            }
+            
+            // --- 阶段2：KCP状态更新 ---
+            uint timestamp = (uint)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            await connection.UpdateAsync(timestamp, ct).ConfigureAwait(false);
+            
+            // --- 阶段3：发送队列处理 ---
+            while (sendChannel.Reader.TryRead(out var data))
+            {
+                try
+                {
+                    await connection.SendAsync(data, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // 发送失败时记录日志，终止连接是可接受的
+                    LogError($"发送失败，终止KCP连接: {ex.Message}");
+                    throw; // 让异常流出工作器
+                }
+            }
+            
+            // --- 阶段4：应用数据接收 ---
+            // 使用WaitAsync实现非阻塞检查
+            try
+            {
+                var packet = await connection.ReceiveAsync(ct)
+                    .WaitAsync(TimeSpan.FromMilliseconds(0), ct)
+                    .ConfigureAwait(false);
+                
+                if (packet.IsNotEmpty)
+                {
+                    ProcessData(packet.Result.Buffer);
+                    packet.Dispose();
+                }
+            }
+            catch (TimeoutException)
+            {
+                // 没有数据可接收，正常情况
+            }
+            
+            // --- 阶段5：循环控制 ---
+            // 根据是否有工作来动态调整等待时间
+            bool hadWork = sendChannel.Reader.Count > 0;
+            await Task.Delay(hadWork ? 1 : 10, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // 正常退出
+            break;
+        }
+        catch (Exception ex)
+        {
+            // 记录错误，但继续运行（除非是致命错误）
+            LogError($"KCP工作器错误: {ex.Message}");
+            await Task.Delay(100, ct).ConfigureAwait(false); // 错误退避
+        }
+    }
+    
+    // 清理：取消任何挂起的接收
+    if (udpReceiveTask != null && !udpReceiveTask.IsCompleted)
+    {
+        try
+        {
+            await udpReceiveTask.WaitAsync(TimeSpan.FromMilliseconds(50), ct);
+        }
+        catch
+        {
+            // 清理期间的异常可忽略
+        }
     }
 }
 
-async Task RunSendLoop(KcpConnection connection, CancellationToken ct)
+// 发送生产者：用户通过此方法发送数据
+async Task SendProducerAsync(
+    System.Threading.Channels.Channel<byte[]> sendChannel,
+    CancellationToken ct)
 {
     int count = 0;
     while (!ct.IsCancellationRequested)
     {
-        var data = Encoding.UTF8.GetBytes($"Message {count++}");
-        await connection.SendAsync(data, ct);
-        await Task.Delay(1000, ct);
-    }
-}
-
-async Task RunReceiveLoop(KcpConnection connection, CancellationToken ct)
-{
-    while (!ct.IsCancellationRequested)
-    {
-        var packet = await connection.ReceiveAsync(ct);
-        if (packet.IsNotEmpty)
+        try
         {
-            // 最优方案：直接使用Buffer，处理完成后立即释放
-            var buffer = packet.Result.Buffer;
-            ProcessData(buffer);
-            packet.Dispose();
+            // 示例：每秒发送一条消息
+            var message = $"Hello KCP {count++}";
+            var data = Encoding.UTF8.GetBytes(message);
+            
+            await sendChannel.Writer.WriteAsync(data, ct).ConfigureAwait(false);
+            LogInfo($"已排队发送: {message}");
+            
+            await Task.Delay(1000, ct).ConfigureAwait(false);
         }
-        await Task.Delay(1, ct);
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            break;
+        }
+        catch (Exception ex)
+        {
+            LogError($"发送生产者错误: {ex.Message}");
+            await Task.Delay(500, ct).ConfigureAwait(false); // 错误退避
+        }
+    }
+}
+
+// 使用示例
+async Task Main()
+{
+    var cts = new CancellationTokenSource();
+    
+    Console.CancelKeyPress += (s, e) =>
+    {
+        e.Cancel = true;
+        cts.Cancel();
+        Console.WriteLine("正在停止...");
+    };
+    
+    try
+    {
+        await RunKcpExampleAsync(cts.Token);
+        Console.WriteLine("正常退出");
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("用户取消");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"错误退出: {ex.Message}");
     }
 }
 ```
 
-### 并行架构说明
-FaGe.Kcp设计为并行执行多个操作：
+### 设计说明
+
+1. **单工作器线程**：所有KCP操作在`KcpWorkerAsync`中顺序执行，避免并发问题
+2. **Channel线程安全**：发送通过Channel实现多生产者到单消费者的转换
+3. **非阻塞设计**：
+   - UDP接收使用"检查-等待-清空"模式
+   - 应用接收使用`WaitAsync(TimeSpan.Zero)`非阻塞检查
+   - 动态等待时间，有工作时响应更快
+4. **错误恢复**：非致命错误记录后继续运行
+5. **优雅停止**：支持Ctrl+C和程序化取消
+
+### 关键优势
+
+✅ **无锁设计**：不需要SemaphoreSlim，所有操作顺序执行  
+✅ **无死锁风险**：不持有锁等待异步操作  
+✅ **线程安全发送**：通过Channel支持多线程发送  
+✅ **资源高效**：动态等待避免CPU空转  
+✅ **简单易懂**：代码结构清晰，易于理解和调试  
+
+### 并行架构
 
 ```
-┌─────────────────┐
-│  RunReceiveLoop │  ← UDP数据接收（后台）
-├─────────────────┤
-│  UpdateLoop     │  ← KCP状态更新（定期10ms，使用UTC时间戳）
-├─────────────────┤
-│  SendLoop       │  ← 应用数据发送
-├─────────────────┤
-│  ReceiveLoop    │  ← 应用数据接收
-└─────────────────┘
+┌─────────────────┐      ┌─────────────────┐
+│ 发送生产者线程  │─────▶│   Channel队列    │
+│  (多线程安全)   │      │   (线程安全)     │
+└─────────────────┘      └────────┬────────┘
+                                   │
+                         ┌─────────▼─────────┐
+                         │  KCP工作器线程     │
+                         │ (单线程顺序执行)   │
+                         │ 1. UDP输入        │
+                         │ 2. KCP更新        │
+                         │ 3. 发送处理       │
+                         │ 4. 应用接收       │
+                         └───────────────────┘
 ```
 
-**最佳实践**：
-1. 按顺序启动所有循环任务，启动完毕前不要等待其中任何一个任务
-2. 任务启动完毕后使用`Task.WhenAll`等待所有任务完成
-3. 在finally块中确保资源释放
-4. 接收数据处理完成后立即调用`packet.Dispose()`
+这个设计既安全又高效，推荐作为标准使用模式。
 
 ## 核心概念
 
@@ -221,71 +380,551 @@ connection.ConfigureNoDelay(
 );
 ```
 
-## 故障排除
+## 并发安全性
 
-### 常见问题
+### 线程安全级别
 
-#### Q1: KcpApplicationPacket多重释放问题
-**问题**：由于`KcpApplicationPacket`包含对内部缓冲区的引用，如果同时持有多个实例并分别释放，会导致多重释放。
+**重要**：FaGe.Kcp 的并发安全性有限，大多数核心方法**不是线程安全的**。这是为了性能和简单性做出的设计权衡。
 
-**解决方案**：
-- 设计为一次性读取、立即释放
-- 如需持久化数据，请调用`.ToArray()`获取副本
-- 避免复制同一个数据包实例
+| 方法 | 并发安全性 | 风险说明 |
+|------|-----------|----------|
+| `SendAsync()` | ❌ 不安全 | 通过`QueueToSenderWithAsyncSource()`操作非线程安全的`snd_queue` |
+| `ReceiveAsync()` | ❌ 不安全 | 底层`TryReadPacket()`操作非线程安全的`rcv_queue`，且`pendingReceiveTaskSource`存在竞争条件 |
+| `UpdateAsync()` | ❌ 不安全 | 无任何同步措施，会修改内部连接状态（snd_queue、rcv_queue等） |
+| `FlushAsync()` | ❌ 不安全 | 修改内部缓冲区状态 |
+| `InputFromUnderlyingTransport()` | ❌ 不安全 | 修改接收队列和缓冲区 |
+| `InputOnce()` | ❌ 不安全 | 调用`InputFromUnderlyingTransport()`，同样修改内部状态 |
 
-#### Q2: 发送数据后收不到ACK
-**可能原因**：
-1. 接收窗口已满，对端停止发送ACK
-2. `UpdateAsync`未正确执行
-3. 网络丢包严重
+### 有限支持的模式
+- **`TryReadPacket()`**：有限支持多消费者，但必须保证顺序：`A读取包1 → A释放 → B读取包2 → B释放`
+- **内部集合**：所有未使用`Concurrent`前缀的集合（`Queue<T>`、`LinkedList<T>`）均无同步机制
 
-**解决方案**：
-1. 检查接收方窗口状态
-2. 确保定期调用`UpdateAsync`（推荐10-50ms间隔）
-3. 调整`fastresend`参数启用快速重传
+### 推荐的使用模式
 
-#### Q3: 内存泄漏或缓冲区累积
-**监控指标**：
+#### ✅ 正确模式：专用异步工作器（推荐）
 ```csharp
-// 监控发送队列状态
-int pendingCount = connection.PacketPendingSentCount;
-if (pendingCount > 300) // 阈值根据应用调整
+public async Task KcpWorkerAsync(
+    KcpConnection connection,
+    Channel<byte[]> sendChannel,
+    CancellationToken ct)
 {
-    // 考虑限流或调整窗口大小
+    Task udpReceiveTask = null;
+    
+    while (!ct.IsCancellationRequested)
+    {
+        try
+        {
+            // --- 阶段1：UDP输入处理 ---
+            if (udpReceiveTask?.IsCompleted == true)
+            {
+                await udpReceiveTask.ConfigureAwait(false); // 处理到达的数据
+                udpReceiveTask = null;
+            }
+            
+            if (udpReceiveTask == null)
+            {
+                // 启动新的非阻塞接收
+                udpReceiveTask = connection.InputOnce(ct);
+            }
+            
+            // --- 阶段2：KCP状态更新 ---
+            uint timestamp = (uint)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            await connection.UpdateAsync(timestamp, ct).ConfigureAwait(false);
+            
+            // --- 阶段3：发送队列处理 ---
+            while (sendChannel.Reader.TryRead(out var data))
+            {
+                await connection.SendAsync(data, ct).ConfigureAwait(false);
+            }
+            
+            // --- 阶段4：应用数据接收 ---
+            // 使用WaitAsync实现非阻塞检查
+            try
+            {
+                var packet = await connection.ReceiveAsync(ct)
+                    .WaitAsync(TimeSpan.FromMilliseconds(0), ct)
+                    .ConfigureAwait(false);
+                
+                if (packet.IsNotEmpty)
+                {
+                    ProcessData(packet.Result.Buffer);
+                    packet.Dispose();
+                }
+            }
+            catch (TimeoutException)
+            {
+                // 没有数据可接收，正常情况
+            }
+            
+            // --- 阶段5：循环控制 ---
+            // 根据是否有工作来动态调整等待时间
+            bool hadWork = sendChannel.Reader.Count > 0;
+            await Task.Delay(hadWork ? 1 : 10, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // 正常退出
+            break;
+        }
+        catch (Exception ex)
+        {
+            // 记录错误，但继续运行（除非是致命错误）
+            LogError($"KCP工作器错误: {ex.Message}");
+            await Task.Delay(100, ct).ConfigureAwait(false); // 错误退避
+        }
+    }
 }
 ```
 
-### 性能调优
-- **时间戳**：**必须使用基于UTC的时间戳，或至少两端时间戳算法一致**：
-  ```csharp
-  // ✅ 正确：使用UTC时间戳，确保两端时间可比
-  uint timestamp = (uint)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-  
-  // ❌ 错误：不同机器启动时间不同，无法比较
-  uint timestamp = (uint)Environment.TickCount64;
-  ```
-  
-- **MTU设置**：**默认1400字节**（基于标准以太网MTU 1500减去IP/UDP头部预留）
-- **窗口大小**：根据网络延迟和带宽调整
-- **更新间隔**：通常10ms，高延迟网络可适当增加
+### InputOnce() 的重要特性
+
+#### 1. 非幂等性
+每个`InputOnce()`调用处理一个UDP数据包，多次调用会处理不同的数据包。
+
+#### 2. 异步阻塞性
+`InputOnce()`会等待直到有数据到达或取消，是异步阻塞操作。
+
+#### 3. 顺序敏感性
+必须按顺序处理`InputOnce()`调用结果，避免多个未完成的调用导致数据包处理顺序错误。
+
+### 已知的竞争条件
+
+#### 1. pendingReceiveTaskSource 竞争
+```csharp
+// 在 ReceiveAsyncBase 中：
+pendingReceiveTaskSource = signalSource;
+
+// 如果两个线程同时调用 ReceiveAsync()：
+// 线程A: 设置 pendingReceiveTaskSource = sourceA
+// 线程B: 设置 pendingReceiveTaskSource = sourceB （覆盖A）
+// 结果：线程A的 TaskCompletionSource 可能永远无法完成
+```
+
+#### 2. 集合操作竞争
+```csharp
+// 同时调用 SendAsync() 和 UpdateAsync()：
+// SendAsync: snd_queue.Enqueue(packet)
+// UpdateAsync: snd_queue.TryDequeue(out packet) // 可能同时发生，导致异常
+```
+
+#### 3. InputOnce 并发调用竞争
+```csharp
+// 同时启动多个 InputOnce() 调用：
+// 调用1: 开始接收数据包A
+// 调用2: 开始接收数据包B
+// 问题：两个调用可能并发修改内部状态，且数据包处理顺序不确定
+```
+
+#### 4. Dispose与其他操作的竞争
+```csharp
+// 线程A: await connection.SendAsync(data, ct);
+// 线程B: connection.Dispose();  // 可能立即触发ObjectDisposedException
+
+// 解决方案：使用CancellationToken协调
+// 所有操作都检查同一个CancellationToken
+// Dispose时取消该token
+```
+
+### 异常处理原则
+
+#### 策略总结
+
+| 异常类型 | 处理方式 | 理由 |
+|---------|---------|------|
+| `OperationCanceledException` (ct触发) | 捕获并`break` | 正常退出流程 |
+| `SocketException` (超时/连接重置等临时错误) | 捕获并继续 | 网络临时问题，可恢复 |
+| `ObjectDisposedException` (取消时) | 捕获并`break` | 资源清理期间的预期异常 |
+| **其他所有异常** | **不捕获，传播出去** | **让调用者感知严重错误** |
+
+#### 为什么让异常流出工作器？
+
+1. **调用者知情权**：调用者需要知道工作器是否因错误退出
+2. **监控和告警**：外部系统可以监控工作器故障
+3. **资源管理**：如果工作器因异常退出，可能需要重建连接
+4. **调试信息**：完整的异常堆栈有助于问题诊断
+
+### 性能与安全权衡
+
+FaGe.Kcp 设计时的权衡：
+
+1. **性能优先**：使用标准集合而非并发集合，减少锁开销
+2. **简单性**：避免复杂的同步逻辑，简化代码结构
+3. **明确责任**：将并发安全的责任交给使用者，提供灵活性
+4. **异步友好**：移除后台循环，完全拥抱async/await模式
+
+### 最佳实践总结
+
+1. **每个连接使用专用异步工作器**（如`KcpWorkerAsync`模式）
+2. **使用"检查-等待-清空"模式管理`InputOnce()`调用**
+3. **避免任何形式的并发方法调用**同一个连接实例
+4. **让严重异常流出工作器**，使调用者能够感知和处理
+5. **谨慎使用`ConfigureAwait(false)`**：
+   - ✅ **推荐在**：控制台应用、后台服务、库代码中使用
+   - ⚠️ **避免在**：ASP.NET Core（通常不需要）、WPF/WinForms UI线程、需要同步上下文的环境中盲目使用
+   - **原则**：如果代码需要回到原始上下文（如更新UI），不要使用`ConfigureAwait(false)`
+6. **正确处理异步异常**：
+   ```csharp
+   // ✅ 正确：保留原始异常堆栈
+   try
+   {
+       workerTask.GetAwaiter().GetResult(); // 抛出原始异常
+   }
+   catch (Exception ex)
+   {
+       // ex包含完整的异步调用堆栈
+   }
+   ```
+7. **服务端使用连接池**，每个连接有独立的异步工作器
+8. **通过Task状态监控工作器健康**（`IsFaulted`、`Exception`、`Status`属性）
+
+## 故障排除
+
+### 并发相关问题
+
+#### Q1: 多个线程调用SendAsync()导致数据混乱或崩溃
+**现象**：数据包丢失、顺序错乱、偶尔抛出`InvalidOperationException`
+
+**原因**：`snd_queue`是非线程安全的`Queue<PacketBuffer>`，多线程并发访问导致竞争条件
+
+**解决方案**：
+1. **使用专用工作器模式**：所有发送操作通过单一工作线程进行
+2. **使用Channel实现线程安全队列**：
+   ```csharp
+   private readonly Channel<byte[]> _sendChannel = Channel.CreateUnbounded<byte[]>();
+   
+   // 多线程安全发送
+   public ValueTask SendThreadSafeAsync(byte[] data, CancellationToken ct)
+       => _sendChannel.Writer.WriteAsync(data, ct);
+   
+   // 在工作器中处理发送
+   while (_sendChannel.Reader.TryRead(out var data))
+   {
+       await _connection.SendAsync(data, ct);
+   }
+   ```
+
+#### Q2: ReceiveAsync()被永久阻塞
+**现象**：`ReceiveAsync()`调用永不返回，即使有数据到达
+
+**原因**：`pendingReceiveTaskSource`被其他线程覆盖，导致TaskCompletionSource无法完成
+
+**解决方案**：
+1. **确保单消费者**：同一时间只有一个`ReceiveAsync()`调用在等待
+2. **使用超时机制**：
+   ```csharp
+   try
+   {
+       var packet = await connection.ReceiveAsync(ct)
+           .WaitAsync(TimeSpan.FromSeconds(5), ct);
+       // 处理数据包
+   }
+   catch (TimeoutException)
+   {
+       // 超时处理：记录日志或重试
+   }
+   ```
+3. **检查工作器设计**：确保接收操作在专用工作线程中顺序执行
+
+#### Q3: InputOnce()调用导致数据包丢失
+**现象**：部分UDP数据包未被KCP处理，直接丢失
+
+**原因**：多个未完成的`InputOnce()`调用竞争接收数据包
+
+**解决方案**：
+1. **使用"检查-等待-清空"模式**：
+   ```csharp
+   Task udpReceiveTask = null;
+   
+   if (udpReceiveTask?.IsCompleted == true)
+   {
+       await udpReceiveTask; // 处理已到达的数据
+       udpReceiveTask = null;
+   }
+   
+   if (udpReceiveTask == null)
+   {
+       udpReceiveTask = connection.InputOnce(ct);
+   }
+   ```
+2. **避免并发调用**：确保同一时间只有一个`InputOnce()`在进行中
+
+### 性能相关问题
+
+#### Q4: CPU使用率过高
+**现象**：KCP工作器占用大量CPU时间
+
+**原因**：工作器循环没有适当的延迟，持续空转
+
+**解决方案**：
+```csharp
+// 添加适当延迟
+await Task.Delay(10, ct).ConfigureAwait(false);
+
+// 或者根据工作负载动态调整
+bool hadWork = /* 检查是否有工作处理 */;
+await Task.Delay(hadWork ? 1 : 10, ct).ConfigureAwait(false);
+```
+
+**推荐延迟时间**：
+- 实时应用：5-10ms
+- 一般应用：10-20ms  
+- 低功耗场景：20-50ms
+
+#### Q5: 内存使用持续增长
+**现象**：应用内存不断增长，最终可能耗尽
+
+**原因**：
+1. `KcpApplicationPacket`未及时释放
+2. 发送队列积压未处理
+3. 内部缓冲区未回收
+
+**解决方案**：
+1. **确保数据包释放**：
+   ```csharp
+   var packet = await connection.ReceiveAsync(ct);
+   try
+   {
+       ProcessData(packet.Result.Buffer);
+   }
+   finally
+   {
+       packet.Dispose(); // 关键！
+   }
+   ```
+2. **监控发送队列**：
+   ```csharp
+   if (connection.PacketPendingSentCount > 1000)
+   {
+       // 发送队列积压，考虑限流或增大窗口
+       LogWarning($"发送队列积压: {connection.PacketPendingSentCount}");
+   }
+   ```
+3. **定期检查连接状态**：使用连接池时，定期清理空闲连接
+
+#### Q6: KcpApplicationPacket多重释放导致数据错乱
+**现象**：后续接收的数据包内容不正确或抛出异常
+
+**原因**：`KcpApplicationPacket`是值类型，复制后多个实例共享内部缓冲区引用。提前释放会影响后续数据包。
+
+**解决方案**：
+```csharp
+// ❌ 错误：复制值类型导致多重引用
+var packet1 = await connection.ReceiveAsync(ct);
+var packet2 = packet1; // 浅拷贝！
+
+// ✅ 正确：立即使用或创建深拷贝
+var packet = await connection.ReceiveAsync(ct);
+if (packet.IsNotEmpty)
+{
+    // 方案1：立即使用并释放
+    var data = packet.Result.Buffer;
+    ProcessData(data);
+    packet.Dispose();
+    
+    // 方案2：需要持久化时创建副本
+    // byte[] copy = packet.Result.Buffer.ToArray();
+    // packet.Dispose();
+    // // 使用copy
+}
+```
+
+#### Q7: SendAsync返回空结果但数据已排队
+**现象**：`SendAsync`立即返回成功但`sentCount`为0
+
+**原因**：在流模式下，数据被合并到前一个分片包中，没有创建新包
+
+**解决方案**：
+```csharp
+var result = await connection.SendAsync(data, ct);
+if (result.IsSucceed)
+{
+    // 即使SentCount为0，也可能已成功排队
+    // 检查是否有异步任务需要等待
+    if (result.asyncSendTask != null)
+    {
+        await result.asyncSendTask; // 等待实际发送完成
+    }
+}
+```
+
+### 网络相关问题
+
+#### Q8: 连接频繁断开或超时
+**现象**：连接不稳定，经常需要重连
+
+**原因及解决方案**：
+
+| 可能原因 | 检查方法 | 解决方案 |
+|---------|---------|----------|
+| `UpdateAsync()`未定期调用 | 检查工作器是否正常执行 | 确保定期调用UpdateAsync(推荐10ms) |
+| 时间戳不正确 | 检查两端时间戳算法 | 使用`DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()` |
+| 网络丢包严重 | 监控重传次数 | 调整`fastresend`参数，启用快速重传 |
+| 窗口大小太小 | 检查窗口使用率 | 增大`SendWindowSize`和`RecvWindowSize` |
+| MTU设置不当 | 检查数据包分片 | 根据网络环境调整MTU(通常1400) |
+
+#### Q9: 高延迟环境性能差
+**现象**：在高延迟网络(>100ms)中性能显著下降
+
+**调优建议**：
+```csharp
+// 高延迟网络专用配置
+connection.ConfigureNoDelay(
+    nodelay: true,     // 启用无延迟模式
+    interval: 30,      // 增加更新间隔
+    resend: 3,         // 降低快速重传阈值
+    nc: false          // 保持拥塞控制
+);
+
+// 增大窗口以适应高延迟
+connection.SendWindowSize = 1024;
+connection.RecvWindowSize = 1024;
+```
 
 ### 调试建议
-FaGe.Kcp计划使用`EventSource`提供跨平台的高性能内核级跟踪（Windows ETW / Linux LTTng）。当前版本可通过修改源码，使用条件编译输出调试信息：
 
+#### 启用基础日志
 ```csharp
-// 条件编译的调试输出
+// 在关键位置添加条件编译的日志
 [Conditional("DEBUG")]
-public static void LogPacket(string eventType, uint conv, uint sn, int length)
+public static void LogKcpEvent(string eventName, params object[] args)
 {
-#if DEBUG
-    Console.WriteLine($"[KCP-{eventType}] Conv:{conv} SN:{sn} Len:{length}");
-#endif
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [KCP] {eventName}: {string.Join(", ", args)}");
+}
+
+// 使用示例
+LogKcpEvent("PacketSent", connectionId, packetSn, length);
+LogKcpEvent("PacketReceived", connectionId, packetSn, length);
+LogKcpEvent("WindowChanged", connectionId, sendWindow, recvWindow);
+```
+
+### 常见错误代码
+
+FaGe.Kcp在内部处理时可能返回以下错误码：
+
+| 错误码 | 含义 | 可能原因 | 解决方案 |
+|--------|------|----------|----------|
+| **-1** | 数据包太短 | UDP数据包小于KCP头部大小(24字节) | 检查对等端实现，确保发送完整KCP数据包 |
+| **-2** | 意料外的CMD | 对等端发送了无效的KCP命令 | 1. 协议版本不匹配<br>2. 数据损坏<br>3. 对等端不是标准KCP实现 |
+| **-3** | 未知命令 | 收到无法识别的命令类型 | 检查对等端KCP实现，确保使用相同协议版本 |
+
+### 预防措施
+
+#### 1. 连接建立时验证
+```csharp
+public async Task<bool> ValidateConnectionAsync(KcpConnection connection, TimeSpan timeout)
+{
+    using var cts = new CancellationTokenSource(timeout);
+    
+    try
+    {
+        // 发送测试包
+        var testData = Encoding.UTF8.GetBytes("TEST");
+        var sendResult = await connection.SendAsync(testData, cts.Token);
+        
+        if (!sendResult.IsSucceed)
+            return false;
+        
+        // 等待响应（带超时）
+        var packet = await connection.ReceiveAsync(cts.Token)
+            .WaitAsync(timeout, cts.Token);
+        
+        return packet.IsNotEmpty;
+    }
+    catch
+    {
+        return false;
+    }
+}
+```
+
+#### 2. 实现健康检查
+```csharp
+public class KcpHealthChecker
+{
+    private readonly KcpConnection _connection;
+    private DateTime _lastActivity = DateTime.UtcNow;
+    
+    public KcpHealthChecker(KcpConnection connection)
+    {
+        _connection = connection;
+    }
+    
+    public void RecordActivity() => _lastActivity = DateTime.UtcNow;
+    
+    public bool IsHealthy(TimeSpan timeout)
+        => DateTime.UtcNow - _lastActivity < timeout;
+    
+    public async Task<bool> PerformHealthCheckAsync(CancellationToken ct)
+    {
+        try
+        {
+            var pingData = Encoding.UTF8.GetBytes("PING");
+            await _connection.SendAsync(pingData, ct);
+            
+            var response = await _connection.ReceiveAsync(ct)
+                .WaitAsync(TimeSpan.FromSeconds(3), ct);
+            
+            if (response.IsNotEmpty)
+            {
+                RecordActivity();
+                return true;
+            }
+        }
+        catch
+        {
+            // 健康检查失败
+        }
+        
+        return false;
+    }
+}
+```
+
+#### 3. 配置合理的超时和重试
+```csharp
+public class ResilientKcpClient
+{
+    private readonly Func<Task<KcpConnection>> _connectionFactory;
+    private readonly int _maxRetries;
+    private readonly TimeSpan _retryDelay;
+    
+    public async Task<TResult> ExecuteWithRetryAsync<TResult>(
+        Func<KcpConnection, CancellationToken, Task<TResult>> operation,
+        CancellationToken ct)
+    {
+        Exception lastException = null;
+        
+        for (int attempt = 0; attempt < _maxRetries; attempt++)
+        {
+            using var connection = await _connectionFactory();
+            
+            try
+            {
+                return await operation(connection, ct);
+            }
+            catch (Exception ex) when (IsTransientError(ex))
+            {
+                lastException = ex;
+                LogWarning($"尝试 {attempt + 1} 失败: {ex.Message}");
+                
+                if (attempt < _maxRetries - 1)
+                {
+                    await Task.Delay(_retryDelay, ct);
+                }
+            }
+        }
+        
+        throw new InvalidOperationException("所有重试尝试都失败", lastException);
+    }
+    
+    private static bool IsTransientError(Exception ex)
+        => ex is SocketException ||
+           ex is TimeoutException ||
+           ex is OperationCanceledException;
 }
 ```
 
 ## 服务端使用提示
-
-FaGe.Kcp 主要提供连接级别的实现，服务端需要自行管理多个客户端连接：
 
 ### 连接管理建议
 ```csharp
@@ -327,6 +966,30 @@ public class KcpServer
         }
     }
 }
+```
+
+### 服务端架构选项
+
+#### 选项1：共享UdpClient（需要路由逻辑）
+```csharp
+// 优点：资源使用少
+// 缺点：需要解析包头并路由到正确连接
+// 适用：连接数少，性能要求不高
+```
+
+#### 选项2：每个连接独立UdpClient
+```csharp
+// 优点：简单，无路由逻辑
+// 缺点：每个连接占用一个端口
+// 适用：连接数可控，需要简单实现
+```
+
+#### 选项3：混合方案
+```csharp
+// 主监听端口接收握手包
+// 握手成功后分配新端口创建专用连接
+// 优点：平衡资源使用和复杂性
+// 缺点：实现复杂，需要端口管理
 ```
 
 ### 注意事项
@@ -383,6 +1046,46 @@ public sealed class CustomKcpConnection : KcpConnectionBase
 3. **避免意外**：防止子类覆盖关键方法导致协议行为异常
 4. **明确的职责**：每个连接类型有明确的传输方式
 
+## 从其他KCP实现迁移
+
+### 主要区别
+
+| 特性 | FaGe.Kcp | 其他实现 |
+|------|----------|----------|
+| **并发模型** | 非线程安全，需工作器模式 | 有些提供线程安全API |
+| **异步支持** | 原生async/await | 可能使用回调或同步API |
+| **资源管理** | 强调`Dispose()`模式 | 可能依赖GC |
+| **API设计** | 流式API (`ReceiveAsync`) | 可能使用轮询模式 |
+| **配置方式** | `ConfigureNoDelay()`方法 | 可能在构造函数中配置 |
+
+### 常见迁移问题
+
+1. **移除后台循环**：FaGe.Kcp没有`RunReceiveLoop()`，需要手动实现工作器
+2. **处理并发安全**：必须确保单线程访问连接
+3. **时间戳处理**：必须使用UTC时间戳
+4. **数据包释放**：必须调用`KcpApplicationPacket.Dispose()`
+
+## 限制和注意事项
+
+### 已知限制
+
+1. **最大包大小**：受`uint`类型限制，单包最大约4GB（理论值）
+2. **分片数量**：受`byte frg`字段限制，最多256个分片
+3. **连接ID范围**：`uint conv`，0为无效值
+4. **窗口大小**：受`uint`类型限制，理论最大约42亿
+
+### 平台特定行为
+
+1. **UDP缓冲区大小**：不同平台默认值不同，可能需要手动调整
+2. **Socket选项**：可能需要设置`ReceiveBufferSize`/`SendBufferSize`
+3. **防火墙/安全软件**：可能影响UDP通信
+
+### 性能特性
+
+1. **内存使用**：窗口越大，内存使用越多
+2. **CPU使用**：更新间隔越小，CPU使用越高
+3. **网络开销**：KCP头部24字节，ACK机制有额外开销
+
 ## 资源释放
 
 ### 必须释放的资源
@@ -410,25 +1113,26 @@ using var packet = await connection.ReceiveAsync(ct);
 ## 主要API参考
 
 ### KcpConnection 主要方法
-| 方法 | 参数 | 说明 |
-|------|------|------|
-| `RunReceiveLoop(CancellationToken)` | `cancellationToken`: 取消令牌 | 启动UDP接收后台循环 |
-| `UpdateAsync(uint timestamp, CancellationToken)` | `timestamp`: **当前UTC时间戳(毫秒)**<br>`cancellationToken`: 取消令牌 | 更新KCP内部状态，**必须定期调用**（推荐10ms间隔） |
-| `SendAsync(ReadOnlyMemory<byte>, CancellationToken)` | `buffer`: 要发送的数据<br>`cancellationToken`: 取消令牌 | 发送应用层数据，返回发送结果 |
-| `ReceiveAsync(CancellationToken)` | `cancellationToken`: 取消令牌 | 接收应用层数据包，返回`KcpApplicationPacket` |
-| `Dispose()` | 无 | 释放连接资源 |
-| `ConfigureNoDelay(bool, int, int, bool)` | `nodelay`: 是否启用无延迟<br>`interval`: 更新间隔(ms)<br>`resend`: 快速重传阈值<br>`nc`: 是否关闭拥塞控制 | 配置协议参数 |
+| 方法 | 参数 | 说明 | 重要行为细节 |
+|------|------|------|-------------|
+| `InputOnce(CancellationToken)` | `cancellationToken`: 取消令牌 | 从UDP接收一次数据并处理 | 1. 异步阻塞操作，等待数据到达<br>2. 同一时间只能有一个进行中的调用<br>3. 使用"检查-等待-清空"模式避免数据包丢失 |
+| `UpdateAsync(uint timestamp, CancellationToken)` | `timestamp`: **当前UTC时间戳(毫秒)**<br>`cancellationToken`: 取消令牌 | 更新KCP内部状态 | 1. **必须定期调用**（推荐10ms间隔）<br>2. 时间戳必须使用UTC时间<br>3. 内部可能调用`FlushAsync()`发送数据 |
+| `SendAsync(ReadOnlyMemory<byte>, CancellationToken)` | `buffer`: 要发送的数据<br>`cancellationToken`: 取消令牌 | 发送应用层数据，返回发送结果 | 1. 在流模式下可能返回`sentCount: 0`（数据合并到前一个包）<br>2. 立即返回，实际发送由后续`UpdateAsync()`触发<br>3. 返回的`Task`在数据放入发送队列时完成，不代表网络发送完成 |
+| `ReceiveAsync(CancellationToken)` | `cancellationToken`: 取消令牌 | 接收应用层数据包，返回`KcpApplicationPacket` | 1. 返回的`KcpApplicationPacket`必须在处理完成后立即`Dispose()`<br>2. 空数据包(`IsEmpty: true`)不需要释放<br>3. 同一时间只能有一个等待中的调用 |
+| `Dispose()` | 无 | 释放连接资源 | 1. 同步释放所有内部资源<br>2. 取消所有挂起的异步操作<br>3. 确保在所有操作完成后调用 |
+| `ConfigureNoDelay(bool, int, int, bool)` | `nodelay`: 是否启用无延迟<br>`interval`: 更新间隔(ms)<br>`resend`: 快速重传阈值<br>`nc`: 是否关闭拥塞控制 | 配置协议参数 | 1. 线程安全，可在初始化时调用<br>2. 后续调用需要考虑同步<br>3. 推荐配置：`(true, 10, 2, false)`用于低延迟 |
 
 ### KcpConnection 主要属性
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `ConnectionId` | `int` | 连接标识符 |
-| `RemoteEndpoint` | `IPEndPoint` | 远程端点 |
-| `IsStreamMode` | `bool` | 是否启用流模式 |
-| `MTU` | `uint` | 最大传输单元，**默认1400字节** |
-| `SendWindowSize` | `int` | 发送窗口大小 |
-| `RecvWindowSize` | `int` | 接收窗口大小 |
-| `PacketPendingSentCount` | `int` | 待发送数据包数量 |
+| 属性 | 类型 | 说明 | 线程安全 |
+|------|------|------|----------|
+| `ConnectionId` | `int` | 连接标识符 | ✅ |
+| `RemoteEndpoint` | `IPEndPoint` | 远程端点 | ✅ |
+| `IsStreamMode` | `bool` | 是否启用流模式 | ✅ |
+| `MTU` | `uint` | 最大传输单元，**默认1400字节** | ✅ |
+| `SendWindowSize` | `int` | 发送窗口大小 | ✅ |
+| `RecvWindowSize` | `int` | 接收窗口大小 | ✅ |
+| `PacketPendingSentCount` | `int` | 待发送数据包数量 | ❌ **必须在工作器线程中读取** |
+| `IsWindowFull` | `bool` | 接收窗口是否已满 | ❌ **必须在工作器线程中读取** |
 
 ### KcpApplicationPacket 主要成员
 | 成员 | 类型 | 说明 |
@@ -438,9 +1142,20 @@ using var packet = await connection.ReceiveAsync(ct);
 | `IsNotEmpty` | `bool` | 判断数据包是否非空 |
 | `Dispose()` | `void` | 释放数据包资源，**必须调用** |
 
+### KcpConnection 线程安全级别
+
+| 方法 | 线程安全 | 并发使用限制 |
+|------|----------|--------------|
+| `SendAsync()` | ❌ 不安全 | 必须通过专用工作器或同步机制调用 |
+| `ReceiveAsync()` | ❌ 不安全 | 同一时间只能有一个等待中的调用 |
+| `UpdateAsync()` | ❌ 不安全 | 不能与其他方法并发调用 |
+| `InputOnce()` | ❌ 不安全 | 同一时间只能有一个进行中的调用 |
+| `Dispose()` | ⚠️ 有条件 | 在所有操作完成后调用，与其他操作并发可能导致异常 |
+| `ConfigureNoDelay()` | ✅ 安全 | 可在初始化时调用，后续调用需同步 |
+
 ## 许可证
 本项目基于 MIT 许可证开源。
 
 ---
 
-**注意**：本README中的示例代码仅供参考，实际使用时请根据具体需求调整错误处理、资源管理和启动停止逻辑。
+**注意**：本README中的示例代码仅供参考，实际使用时请根据具体需求调整错误处理、资源管理和启动停止逻辑。对于生产环境使用，建议充分测试并发安全性和异常处理逻辑。
