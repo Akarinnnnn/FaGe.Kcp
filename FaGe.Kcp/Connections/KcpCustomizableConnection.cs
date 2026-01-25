@@ -3,19 +3,13 @@ using System.Diagnostics;
 
 namespace FaGe.Kcp.Connections;
 
-public sealed class KcpCustomizableConnection : KcpConnectionBase
+public sealed class KcpCustomizableConnection(uint conversationId, KcpConnectionOptionsBase? options = null) : KcpConnectionBase(conversationId, options)
 {
-	public KcpCustomizableConnection(uint conversationId) : base(conversationId)
-	{
-	}
-
 	public Func<ReadOnlyMemory<byte>, KcpCustomizableConnection, CancellationToken, ValueTask>? OutputCallbackAsync { get; set; }
 
-	protected sealed override ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+	protected override ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
 	{
 		Debug.Assert(OutputCallbackAsync != null);
 		return OutputCallbackAsync(buffer, this, cancellationToken);
 	}
-
-	public void ExternalUpdate(uint timeTickNow) => Update(timeTickNow);
 }

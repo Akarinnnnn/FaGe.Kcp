@@ -1,9 +1,11 @@
 ﻿using DanmakuR.Protocol.Buffer;
+using FaGe.Kcp.Tracing;
 using FaGe.Kcp.Utility;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Runtime.CompilerServices;
 using static FaGe.Kcp.KcpConst;
 
 namespace FaGe.Kcp.Connections;
@@ -155,8 +157,6 @@ public abstract class KcpConnectionBase : IDisposable
 	/// 取消拥塞控制
 	/// </summary>
 	protected bool NoCwnd { get => nocwnd != 0; set => nocwnd = value ? 1 : 0; }
-	// 考虑用EventSource
-	protected int logmask;
 	#endregion
 
 	/// <summary>
@@ -182,7 +182,7 @@ public abstract class KcpConnectionBase : IDisposable
 	[Obsolete]
 	private int stream => IsStreamMode ? 1 : 0;
 
-	private int ControlPacketBufferSize => (int)(mtu % IKCP_OVERHEAD * IKCP_OVERHEAD);
+	private int FlushBufferSize => (int)(mtu % IKCP_OVERHEAD * IKCP_OVERHEAD);
 
 #pragma warning restore
 
@@ -205,9 +205,12 @@ public abstract class KcpConnectionBase : IDisposable
 		snd_buf = new();
 		rcv_queue = new();
 
-		flushBuffer = new(AckOutputTemporaryBufferPool, ControlPacketBufferSize);
+		flushBuffer = new(AckOutputTemporaryBufferPool, FlushBufferSize);
 	}
 
+	/// <summary>
+	/// 连接被关闭时、以及关闭后Flush触发此事件
+	/// </summary>
 	public event Action? OnConnectionWasClosed;
 
 	protected void InvokeOnConnectionWasClosed()
@@ -228,7 +231,7 @@ public abstract class KcpConnectionBase : IDisposable
 
 			mtu = newmtu;
 			mss = newmss;
-			flushBuffer = new(AckOutputTemporaryBufferPool, ControlPacketBufferSize);
+			flushBuffer = new(AckOutputTemporaryBufferPool, FlushBufferSize);
 		}
 	}
 
@@ -255,7 +258,7 @@ public abstract class KcpConnectionBase : IDisposable
 	public int SendWindowSize
 	{
 		get => (int)snd_wnd;
-		set
+		private set
 		{
 			ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, nameof(SendWindowSize));
 			snd_wnd = (uint)value;
@@ -264,7 +267,7 @@ public abstract class KcpConnectionBase : IDisposable
 	public int RecvWindowSize
 	{
 		get => (int)rcv_wnd;
-		set
+		private set
 		{
 			ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value, nameof(RecvWindowSize));
 			rcv_wnd = (uint)value;
@@ -324,13 +327,23 @@ public abstract class KcpConnectionBase : IDisposable
 	/// <returns></returns>
 	protected abstract ValueTask InvokeOutputCallbackAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken);
 
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private ValueTask InvokeOutputWithEventTrace(ReadOnlyMemory<byte> buffer, CancellationToken ct)
+	{
+		KcpTraceEventSource.Log.KcpOutputBegin(conv, buffer.Length);
+		return InvokeOutputCallbackAsync(buffer, ct);
+	}
+
 	/// <summary>
 	/// 
 	/// </summary>
 	/// <param name="buffer"></param>
-	/// <param name="source"></param>
+	/// <param name="source">在数据包到达下层时，会被通知完成的 <see cref="TaskCompletionSource"/></param>
 	/// <param name="ct"></param>
 	/// <returns></returns>
+	/// <remarks>
+	/// <paramref name="source"/>完成时机可能会在将来更改为数据包被确认送达时。
+	/// </remarks>
 	public KcpSendResult QueueToSenderWithAsyncSource(ReadOnlyMemory<byte> buffer, TaskCompletionSource? source, CancellationToken ct)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, this);
@@ -375,10 +388,12 @@ public abstract class KcpConnectionBase : IDisposable
 			if (source is not null)
 			{
 				packetOfLastFragment?.SetOnPacketFinished(source, ct);
+				KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
 				return KcpSendResult.Succeed(sent, source);
 			}
 			else
 			{
+				KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
 				return KcpSendResult.Succeed(sent);
 			}
 		}
@@ -397,16 +412,19 @@ public abstract class KcpConnectionBase : IDisposable
 				if (source is not null)
 				{
 					packetOfLastFragment?.SetOnPacketFinished(source, ct);
+					KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
 					return KcpSendResult.Succeed(sent, source);
 				}
 				else
 				{
+					KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
 					return KcpSendResult.Succeed(sent);
 				}
 			}
 			else
 			{
-				return KcpSendResult.Fail(KcpSendStatus.TryAgainLater);
+				KcpTraceEventSource.Log.KcpSendEnd(conv, sent, -2);
+				return KcpSendResult.Fail(KcpSendStatus.TryAgainLater) with { SentCount = sent };
 			}
 		}
 
@@ -420,10 +438,12 @@ public abstract class KcpConnectionBase : IDisposable
 				if (source is not null)
 				{
 					source.SetCanceled(ct);
+					KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
 					return KcpSendResult.Succeed(sent, source);
 				}
 				else
 				{
+					KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
 					return KcpSendResult.Succeed(sent);
 				}
 			}
@@ -439,6 +459,9 @@ public abstract class KcpConnectionBase : IDisposable
 				? (byte)(packetCount - i - 1) // 6packets idx: [5, 4, 3, 2, 1, 0] 
 				: (byte)0;
 
+			if (IsStreamMode)
+				KcpTraceEventSource.Log.KcpFragmentReassembled(conv, newPacket.HeaderRef.sn, packetCount, newPacket.HeaderRef.frg);
+
 			sent += size;
 
 			packetOfLastFragment = newPacket;
@@ -448,10 +471,12 @@ public abstract class KcpConnectionBase : IDisposable
 		if (source is not null)
 		{
 			packetOfLastFragment?.SetOnPacketFinished(source, ct);
+			KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
 			return KcpSendResult.Succeed(sent, source);
 		}
 		else
 		{
+			KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
 			return KcpSendResult.Succeed(sent);
 		}
 	}
@@ -465,7 +490,7 @@ public abstract class KcpConnectionBase : IDisposable
 	/// <returns>输入结果，包含接受的数据长度。若没有全部接受，可能需要缓存数据。</returns>
 	protected KcpInputResult InputFromUnderlyingTransport(ReadOnlyMemory<byte> buffer)
 	{
-		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+		ObjectDisposedException.ThrowIf(IsDisposed, this);
 
 		if (buffer.Length < IKCP_OVERHEAD)
 		{
@@ -488,6 +513,7 @@ public abstract class KcpConnectionBase : IDisposable
 
 			if (headerSafe is null)
 			{
+				KcpTraceEventSource.Log.KcpInputResult(-1, conv);
 				return new(-1);
 			}
 
@@ -495,10 +521,16 @@ public abstract class KcpConnectionBase : IDisposable
 			// var dataBuffer = buffer.Slice(offset); 交给下面
 
 			if (header.conv != conv)
+			{
+				KcpTraceEventSource.Log.KcpInputResult(-2, conv);
 				return new(-2);
+			}
 
 			if (buffer.Length < header.len + IKCP_OVERHEAD)
+			{
+				KcpTraceEventSource.Log.KcpInputResult(-1, conv);
 				return new(-1);
+			}
 
 			switch (header.cmd)
 			{
@@ -508,6 +540,7 @@ public abstract class KcpConnectionBase : IDisposable
 				case KcpCommand.WindowSizeTell:
 					break;
 				default:
+					KcpTraceEventSource.Log.KcpInputResult(-3, conv);
 					return new(-3);
 			}
 
@@ -536,11 +569,11 @@ public abstract class KcpConnectionBase : IDisposable
 					latest_ts = header.ts;
 				}
 
-				// TODO ETW Logs
+				KcpTraceEventSource.Log.KcpRemoteAckReceived(conv, header.sn, header.ts);
 			}
 			else if (header.cmd == KcpCommand.Push)
 			{
-				// TODO ETW Logs
+				KcpTraceEventSource.Log.KcpRemotePushReceived(conv, header.sn, header.ts, header.len);
 
 				if (TimeDiffSigned(header.sn, rcv_nxt + rcv_wnd) < 0)
 				{
@@ -574,14 +607,15 @@ public abstract class KcpConnectionBase : IDisposable
 			else if (header.cmd == KcpCommand.WindowProbe)
 			{
 				probe |= AskType.Tell;
-				// TODO ETW Logs
+				KcpTraceEventSource.Log.KcpProbeReceived(conv);
 			}
 			else if (header.cmd == KcpCommand.WindowSizeTell)
 			{
-				// do nothing, log to ETW
+				KcpTraceEventSource.Log.KcpWindowTold(conv, header.wnd);
 			}
 			else
 			{
+				KcpTraceEventSource.Log.KcpInputResult(-3, conv);
 				return new(-3);
 			}
 
@@ -620,6 +654,7 @@ public abstract class KcpConnectionBase : IDisposable
 			}
 		}
 
+		KcpTraceEventSource.Log.KcpInputResult(0, conv);
 		return new(0);
 	}
 
@@ -636,6 +671,8 @@ public abstract class KcpConnectionBase : IDisposable
 		if (isWindowFull != newState)
 		{
 			isWindowFull = newState;
+
+			KcpTraceEventSource.Log.KcpWindowFullStateChange(conv, isWindowFull, rcv_wnd);
 			Trace.WriteLine($"[FaGe.KCP] 连接 {conv} 窗口状态变化: " +
 				$"{(newState ? "已满" : "有空闲")} ({totalPackets}/{effectiveWindow})");
 		}
@@ -698,7 +735,10 @@ public abstract class KcpConnectionBase : IDisposable
 
 		if (!isRepeat)
 		{
-			// TODO ETW Log, write header
+			KcpTraceEventSource.Log.KcpWriteHeader(conv, packet.HeaderRef.conv, (uint)packet.HeaderRef.cmd,
+				packet.HeaderRef.frg, packet.HeaderRef.wnd,
+				packet.HeaderRef.ts, packet.HeaderRef.sn, packet.HeaderRef.una,
+				packet.HeaderRef.len);
 
 			if (p == null)
 			{
@@ -796,9 +836,11 @@ public abstract class KcpConnectionBase : IDisposable
 			}
 		}
 
-		var rto = rx_srtt + Math.Max(interval, 4 * rx_rttval);
+		uint rto = rx_srtt + Math.Max(interval, 4 * rx_rttval);
 
 		rx_rto = Bound(rx_minrto, rto, IKCP_RTO_MAX);
+
+		KcpTraceEventSource.Log.KcpRttUpdated(conv, rtt, rx_rto);
 	}
 
 	private static uint Bound(uint lower, uint middle, uint upper)
@@ -834,14 +876,22 @@ public abstract class KcpConnectionBase : IDisposable
 	public KcpApplicationPacket TryReadPacket(CancellationToken cancellationToken)
 	{
 		if (rcv_queue.Count == 0)
+		{
+			KcpTraceEventSource.Log.KcpReceiveFailed(0, conv);
 			return default; // 使source为null，确保不会调用Advance
+		}
 
 		ReadOnlySequence<byte> result = GetFirstPacketMemory(out int fragmentCount);
 
 		if (fragmentCount == -1)
+		{
+			KcpTraceEventSource.Log.KcpReceiveFailed(-2, conv);
 			return default;
+		}
 
-		ReadResult readResult = new(result, IsDisposed, cancellationToken.IsCancellationRequested);
+		ReadResult readResult = new(result, cancellationToken.IsCancellationRequested, IsDisposed);
+
+		KcpTraceEventSource.Log.KcpReceived(conv, (int)result.Length);
 
 		return new KcpApplicationPacket(readResult, this, fragmentCount);
 	}
@@ -1022,9 +1072,13 @@ public abstract class KcpConnectionBase : IDisposable
 	/// </summary>
 	/// <param name="timeMillisecNow">现在的时间戳，以毫秒为单位。</param>
 	/// <returns>是否需要立即调用<see cref="FlushAsync(CancellationToken)"/>执行刷新操作。</returns>
+	/// <remarks>
+	/// 调用方需要确保对等端两方采用相同的时钟基准，否则可能导致传输异常。
+	/// </remarks>
 	public bool Update(uint timeMillisecNow)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+		KcpTraceEventSource.Log.KcpUpdateBegin(conv, timeMillisecNow);
 
 		current = timeMillisecNow;
 
@@ -1127,16 +1181,18 @@ public abstract class KcpConnectionBase : IDisposable
 
 
 	/// <summary>
-	/// 异步执行IO操作，通常在更新时钟时已经执行。
+	/// 异步执行IO操作，通常在异步更新时钟时已经执行。
 	/// </summary>
 	public async ValueTask FlushAsync(CancellationToken ct)
 	{
 		ObjectDisposedException.ThrowIf(IsDisposed, nameof(KcpConnectionBase));
+		KcpTraceEventSource.Log.KcpFlush(conv);
 
 		// 确保窗口状态是最新的
 		UpdateWindowFullState();
 
-		// 我们很难在这里使用局部变量来创建临时缓冲区，因为源自stackalloc的内存必须在堆栈上分配，无法在异步点跨越堆栈边界。
+		// 与另一个.NET实现不同，这里不会使用stackalloc来创建临时缓冲区。
+		// 因为我们很难在这里使用局部变量来创建临时缓冲区，因为源自stackalloc的内存必须在堆栈上分配，无法在异步点跨越堆栈边界。
 		// 因此，我们使用一个租赁的缓冲区来存储数据，直到调用输出回调。
 		// `current`, store
 		uint tickNow = current;
@@ -1161,7 +1217,7 @@ public abstract class KcpConnectionBase : IDisposable
 
 		// 发送控制包
 		// 估测将使用3个包大小的buffer
-		flushBuffer.EnsureCapacity(ControlPacketBufferSize);
+		flushBuffer.ResetCapacity(FlushBufferSize);
 
 		while (acklist.TryDequeue(out var ack))
 		{
@@ -1170,17 +1226,20 @@ public abstract class KcpConnectionBase : IDisposable
 			if (flushBuffer.EncodedPacketsMemory.Length + IKCP_OVERHEAD > MTU)
 			{
 				// 已编码+当前的ACK数量超过MTU，调用输出回调
-				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 				flushBuffer.Reset();
 			}
 
 			if (!flushBuffer.TryWriteHeaderOnlyPacket(ackHeader))
 			{
-				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
-				flushBuffer.Reset();
+				await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
+				flushBuffer.ResetCapacity((int)MTU);
+
 				bool result = flushBuffer.TryWriteHeaderOnlyPacket(ackHeader);
+				
 				Debug.Assert(result, "无法写入ACK包到空的flushBuffer中，内部bug或设置不当？");
-				throw new ArgumentException("无法写入ACK包到空的flushBuffer中，可能是MTU,MSS设置过小。", nameof(MTU));
+				if (!result)
+					throw new ArgumentException("无法写入ACK包到空的flushBuffer中，可能是MTU,MSS设置过小。", nameof(MTU));
 			}
 		}
 
@@ -1225,13 +1284,13 @@ public abstract class KcpConnectionBase : IDisposable
 			if (flushBuffer.EncodedPacketsMemory.Length + IKCP_OVERHEAD > MTU)
 			{
 				// 已编码+当前的ACK数量超过MTU，调用输出回调
-				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 				flushBuffer.Reset();
 			}
 
 			if (!flushBuffer.TryWriteHeaderOnlyPacket(probeSendHeader))
 			{
-				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 				flushBuffer.Reset();
 				bool result = flushBuffer.TryWriteHeaderOnlyPacket(probeSendHeader);
 				Debug.Assert(result, "无法写入PROBE包到空的flushBuffer中，内部bug或设置不当？");
@@ -1247,13 +1306,13 @@ public abstract class KcpConnectionBase : IDisposable
 			if (flushBuffer.EncodedPacketsMemory.Length + IKCP_OVERHEAD > MTU)
 			{
 				// 已编码+当前的ACK数量超过MTU，调用输出回调
-				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 				flushBuffer.Reset();
 			}
 
 			if (!flushBuffer.TryWriteHeaderOnlyPacket(probeTellHeader))
 			{
-				await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+				await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 				flushBuffer.Reset();
 				bool result = flushBuffer.TryWriteHeaderOnlyPacket(probeTellHeader);
 				Debug.Assert(result, "无法写入PROBE包到空的flushBuffer中，内部bug或设置不当？");
@@ -1270,7 +1329,7 @@ public abstract class KcpConnectionBase : IDisposable
 			cwndLocal = Math.Min(cwnd, cwndLocal);
 		}
 
-		await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+		await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 		flushBuffer.Reset();
 
 		// 将数据包从发送队列移动到发送缓冲区
@@ -1286,7 +1345,6 @@ public abstract class KcpConnectionBase : IDisposable
 					ts = tickNow,
 					sn = snd_nxt,
 					una = rcv_nxt,
-
 				};
 
 				packet.HeaderRef = pushHeader;
@@ -1298,7 +1356,6 @@ public abstract class KcpConnectionBase : IDisposable
 
 				snd_buf.AddLast(packet);
 				snd_nxt++;
-
 			}
 			else
 			{
@@ -1349,6 +1406,8 @@ public abstract class KcpConnectionBase : IDisposable
 					|| fastlimit <= 0)
 				{
 					needsend = true;
+					KcpTraceEventSource.Log.KcpFastRetransmit(conv, packet.HeaderRef.sn,
+						packet.PacketControlFields.fastack, resent);
 					packet.PacketControlFields.xmit++;
 					packet.PacketControlFields.fastack = 0;
 					packet.PacketControlFields.resendts = tickNow + packet.PacketControlFields.rto;
@@ -1379,7 +1438,7 @@ public abstract class KcpConnectionBase : IDisposable
 				int size = flushBuffer.EncodedPacketsMemory.Length;
 				if (size + need > MTU)
 				{
-					await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+					await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 					flushBuffer.Reset();
 				}
 
@@ -1387,10 +1446,23 @@ public abstract class KcpConnectionBase : IDisposable
 				
 				if (!flushBuffer.TryWritePacket(packet))
 				{
-					// ETW LOG
+					if (packet.Length > MTU)
+					{
+						throw new ArgumentException("无法写入数据包到flushBuffer中，可能是MTU,MSS设置过小。", nameof(MTU));
+					}
+					KcpTraceEventSource.Log.KcpFlushBufferNotEnough(conv,
+						MTU,
+						packet.HeaderRef.sn,
+						packet.PacketControlFields.xmit,
+						flushBuffer.EncodedPacketsMemory.Length,
+						need);
+					await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
+					flushBuffer.Reset();
+					continue;
 				}
 
-				// TODO 用EventSource改写
+				KcpTraceEventSource.Log.KcpEmittingSinglePushPacket(conv, packet.Length, packet.HeaderRef.sn,
+					packet.HeaderRef.frg, packet.HeaderRef.wnd, packet.HeaderRef.una);
 				//if (CanLog(KcpLogMask.IKCP_LOG_NEED_SEND))
 				//{
 				//	LogWriteLine($"{segment.ToLogString(true)}", KcpLogMask.IKCP_LOG_NEED_SEND.ToString());
@@ -1399,7 +1471,7 @@ public abstract class KcpConnectionBase : IDisposable
 				if (packet.PacketControlFields.xmit >= dead_link)
 				{
 					Dispose();
-					// TODO 用EventSource改写
+					KcpTraceEventSource.Log.KcpDeadLink(conv, packet.PacketControlFields.xmit, dead_link);
 					//if (CanLog(KcpLogMask.IKCP_LOG_DEAD_LINK))
 					//{
 					//	LogWriteLine($"state = -1; xmit:{segment.xmit} >= dead_link:{dead_link}", KcpLogMask.IKCP_LOG_DEAD_LINK.ToString());
@@ -1409,7 +1481,7 @@ public abstract class KcpConnectionBase : IDisposable
 		}
 
 		// flash remain segments
-		await InvokeOutputCallbackAsync(flushBuffer.EncodedPacketsMemory, ct);
+		await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 		flushBuffer.Reset();
 
 		#region update ssthresh
@@ -1424,6 +1496,8 @@ public abstract class KcpConnectionBase : IDisposable
 			}
 
 			cwnd = ssthresh + resent;
+			KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
+
 			incr = cwnd * mss;
 		}
 
@@ -1436,16 +1510,19 @@ public abstract class KcpConnectionBase : IDisposable
 			}
 
 			cwnd = 1;
+			KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
+
 			incr = mss;
 		}
 
 		if (cwnd < 1)
 		{
 			cwnd = 1;
+			KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
+
 			incr = mss;
 		}
 		#endregion
-
 		if (IsDisposed)
 		{
 			InvokeOnConnectionWasClosed();
