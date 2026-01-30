@@ -8,8 +8,8 @@ public struct KcpApplicationPacket(ReadResult result, KcpConnectionBase source, 
 #pragma warning restore IDE0250 // 此结构可能会修改source，因此不应将其设置为 “readonly”
 {
 	public readonly ReadResult Result = result;
-	public readonly bool IsNotEmpty => source != null;
-	public readonly bool IsEmpty => source == null;
+	public readonly bool IsValid => source != null;
+	public readonly bool IsInvalid => source == null;
 
 	private KcpConnectionBase? source = source;
 	private readonly int packetFragmentsCount = packetFragmentCount;

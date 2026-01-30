@@ -1018,7 +1018,7 @@ public abstract class KcpConnectionBase : IDisposable
 	protected ValueTask<KcpApplicationPacket> ReceiveAsyncBase(CancellationToken cancellationToken)
 	{
 		var appPacket = TryReadPacket(cancellationToken);
-		if (appPacket.IsNotEmpty)
+		if (appPacket.IsValid)
 			return ValueTask.FromResult(appPacket);
 
 		TaskCompletionSource signalSource = new();

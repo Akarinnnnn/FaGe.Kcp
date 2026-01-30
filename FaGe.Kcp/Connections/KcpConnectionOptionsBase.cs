@@ -1,7 +1,9 @@
-﻿namespace FaGe.Kcp.Connections
+﻿using System.Buffers;
+
+namespace FaGe.Kcp.Connections
 {
 	public class KcpConnectionOptionsBase
 	{
-		public bool IsPipeMode { get; set; } = false;
+		public ArrayPool<byte>? InternalPacketMemoryPool { get; set; }
 	}
 }

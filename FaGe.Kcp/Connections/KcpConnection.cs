@@ -47,7 +47,7 @@ public sealed class KcpConnection(UdpClient udpTransport, uint connectionId, IPE
 		static async ValueTask DiscardBytesSent(ValueTask<int> discarding) => _ = await discarding;
 	}
 
-	public async Task ReceiveOnceAsync(CancellationToken cancellationToken)
+	public async Task ReceiveUdpOnceAsync(CancellationToken cancellationToken)
 	{
 		cancellationToken.ThrowIfCancellationRequested();
 		UdpReceiveResult result = await udpTransport.ReceiveAsync(cancellationToken);
