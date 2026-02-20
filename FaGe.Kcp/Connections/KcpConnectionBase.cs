@@ -387,9 +387,7 @@ public abstract class KcpConnectionBase : IDisposable
 		{
 			if (source is not null)
 			{
-				packetOfLastFragment?.SetOnPacketFinished(source, ct);
-				KcpTraceEventSource.Log.KcpSendEnd(conv, sent, 0);
-				return KcpSendResult.Succeed(sent, source);
+				packetOfLastFragment = new PacketBuffer(ArrayPool<byte>.Shared, 0, true);
 			}
 			else
 			{
@@ -459,9 +457,14 @@ public abstract class KcpConnectionBase : IDisposable
 				? (byte)(packetCount - i - 1) // 6packets idx: [5, 4, 3, 2, 1, 0] 
 				: (byte)0;
 
-			if (IsStreamMode)
-				KcpTraceEventSource.Log.KcpFragmentReassembled(conv, newPacket.HeaderRef.sn, packetCount, newPacket.HeaderRef.frg);
-
+			if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+				KcpTraceEventSource.Log.KcpFragmentReassembled(
+					conv, 
+					newPacket.HeaderRef.sn, 
+					packetCount, 
+					newPacket.HeaderRef.frg,
+					IsStreamMode);
+			
 			sent += size;
 
 			packetOfLastFragment = newPacket;
@@ -569,11 +572,13 @@ public abstract class KcpConnectionBase : IDisposable
 					latest_ts = header.ts;
 				}
 
-				KcpTraceEventSource.Log.KcpRemoteAckReceived(conv, header.sn, header.ts);
+				if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+					KcpTraceEventSource.Log.KcpRemoteAckReceived(conv, header.sn, header.ts);
 			}
 			else if (header.cmd == KcpCommand.Push)
 			{
-				KcpTraceEventSource.Log.KcpRemotePushReceived(conv, header.sn, header.ts, header.len);
+				if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+					KcpTraceEventSource.Log.KcpRemotePushReceived(conv, header.sn, header.ts, header.len);
 
 				if (TimeDiffSigned(header.sn, rcv_nxt + rcv_wnd) < 0)
 				{
@@ -672,9 +677,7 @@ public abstract class KcpConnectionBase : IDisposable
 		{
 			isWindowFull = newState;
 
-			KcpTraceEventSource.Log.KcpWindowFullStateChange(conv, isWindowFull, rcv_wnd);
-			Trace.WriteLine($"[FaGe.KCP] 连接 {conv} 窗口状态变化: " +
-				$"{(newState ? "已满" : "有空闲")} ({totalPackets}/{effectiveWindow})");
+			KcpTraceEventSource.Log.KcpWindowFullStateChange(conv, isWindowFull, rcv_wnd, totalPackets, effectiveWindow);
 		}
 	}
 
@@ -735,10 +738,11 @@ public abstract class KcpConnectionBase : IDisposable
 
 		if (!isRepeat)
 		{
-			KcpTraceEventSource.Log.KcpWriteHeader(conv, packet.HeaderRef.conv, (uint)packet.HeaderRef.cmd,
-				packet.HeaderRef.frg, packet.HeaderRef.wnd,
-				packet.HeaderRef.ts, packet.HeaderRef.sn, packet.HeaderRef.una,
-				packet.HeaderRef.len);
+			if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+				KcpTraceEventSource.Log.KcpHeaderWasRead(conv, packet.HeaderRef.conv, (uint)packet.HeaderRef.cmd,
+					packet.HeaderRef.frg, packet.HeaderRef.wnd,
+					packet.HeaderRef.ts, packet.HeaderRef.sn, packet.HeaderRef.una,
+					packet.HeaderRef.len);
 
 			if (p == null)
 			{
@@ -840,7 +844,8 @@ public abstract class KcpConnectionBase : IDisposable
 
 		rx_rto = Bound(rx_minrto, rto, IKCP_RTO_MAX);
 
-		KcpTraceEventSource.Log.KcpRttUpdated(conv, rtt, rx_rto);
+		if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+			KcpTraceEventSource.Log.KcpRttUpdated(conv, rtt, rx_rto);
 	}
 
 	private static uint Bound(uint lower, uint middle, uint upper)
@@ -851,7 +856,7 @@ public abstract class KcpConnectionBase : IDisposable
 		snd_una = snd_buf.Count > 0 ? snd_buf.First!.Value.HeaderRef.sn : snd_nxt;
 	}
 
-	protected void ParseUnacknowedged(uint una)
+	private void ParseUnacknowedged(uint una) // TODO private
 	{
 		// p = p.Next看着吓人但是目前版本(NET10)能行
 		for (var p = snd_buf.First; p != null; p = p.Next)
@@ -1406,8 +1411,9 @@ public abstract class KcpConnectionBase : IDisposable
 					|| fastlimit <= 0)
 				{
 					needsend = true;
-					KcpTraceEventSource.Log.KcpFastRetransmit(conv, packet.HeaderRef.sn,
-						packet.PacketControlFields.fastack, resent);
+					if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+						KcpTraceEventSource.Log.KcpFastRetransmit(conv, packet.HeaderRef.sn,
+							packet.PacketControlFields.fastack, resent);
 					packet.PacketControlFields.xmit++;
 					packet.PacketControlFields.fastack = 0;
 					packet.PacketControlFields.resendts = tickNow + packet.PacketControlFields.rto;
@@ -1424,7 +1430,6 @@ public abstract class KcpConnectionBase : IDisposable
 					throw new OperationCanceledException("FlushAsync was canceled.", ct);
 				}
 				packet.SetAsnycCompleted();
-				packet.MarkPacketCompleted();
 
 				packet.HeaderRef = packet.HeaderRef with
 				{
@@ -1455,18 +1460,16 @@ public abstract class KcpConnectionBase : IDisposable
 						packet.HeaderRef.sn,
 						packet.PacketControlFields.xmit,
 						flushBuffer.EncodedPacketsMemory.Length,
-						need);
+						need,
+						flushBuffer.BufferSizeLimit);
 					await InvokeOutputWithEventTrace(flushBuffer.EncodedPacketsMemory, ct);
 					flushBuffer.Reset();
 					continue;
 				}
 
-				KcpTraceEventSource.Log.KcpEmittingSinglePushPacket(conv, packet.Length, packet.HeaderRef.sn,
-					packet.HeaderRef.frg, packet.HeaderRef.wnd, packet.HeaderRef.una);
-				//if (CanLog(KcpLogMask.IKCP_LOG_NEED_SEND))
-				//{
-				//	LogWriteLine($"{segment.ToLogString(true)}", KcpLogMask.IKCP_LOG_NEED_SEND.ToString());
-				//}
+				if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+						KcpTraceEventSource.Log.KcpEmittingSinglePushPacket(conv, packet.Length, packet.HeaderRef.sn,
+							packet.HeaderRef.frg, packet.HeaderRef.wnd, packet.HeaderRef.una);
 
 				if (packet.PacketControlFields.xmit >= dead_link)
 				{
@@ -1477,6 +1480,8 @@ public abstract class KcpConnectionBase : IDisposable
 					//	LogWriteLine($"state = -1; xmit:{segment.xmit} >= dead_link:{dead_link}", KcpLogMask.IKCP_LOG_DEAD_LINK.ToString());
 					//}
 				}
+
+				snd_buf.Remove(node);
 			}
 		}
 
@@ -1496,7 +1501,8 @@ public abstract class KcpConnectionBase : IDisposable
 			}
 
 			cwnd = ssthresh + resent;
-			KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
+			if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+				KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
 
 			incr = cwnd * mss;
 		}
@@ -1510,7 +1516,8 @@ public abstract class KcpConnectionBase : IDisposable
 			}
 
 			cwnd = 1;
-			KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
+			if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+				KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
 
 			incr = mss;
 		}
@@ -1518,7 +1525,8 @@ public abstract class KcpConnectionBase : IDisposable
 		if (cwnd < 1)
 		{
 			cwnd = 1;
-			KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
+			if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+				KcpTraceEventSource.Log.KcpCongestionWindowChange(conv, cwnd, ssthresh, incr);
 
 			incr = mss;
 		}
@@ -1653,6 +1661,8 @@ public abstract class KcpConnectionBase : IDisposable
 		}
 
 		NoCwnd = nc;
+
+		KcpTraceEventSource.Log.KcpNoDelayChanged(conv, nodelay, interval, resend, nc);
 	}
 
 	/// <summary>
@@ -1670,6 +1680,7 @@ public abstract class KcpConnectionBase : IDisposable
 			}
 
 			disposedValue = true;
+			KcpTraceEventSource.Log.KcpConnectionDisposed(conv);
 		}
 	}
 

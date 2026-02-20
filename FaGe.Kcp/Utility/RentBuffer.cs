@@ -1,4 +1,5 @@
-﻿using System;
+﻿using FaGe.Kcp.Tracing;
+using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Text;
@@ -9,7 +10,27 @@ namespace FaGe.Kcp.Utility
 	{
 		private readonly ArrayPool<byte> source = source;
 
-		public byte[]? Buffer { get; private set; } = source.Rent(size);
+		public byte[]? Buffer { get; private set; } = DoInitialRent(size, source);
+
+		private static byte[] DoInitialRent(int size, ArrayPool<byte> source)
+		{
+			var buffer = source.Rent(size);
+
+			if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+				KcpTraceEventSource.Log.KcpBufferWasRent(0, size, buffer.Length);
+			
+			return buffer;
+		}
+
+		public readonly int Capacity
+		{
+			get
+			{
+				ObjectDisposedException.ThrowIf(Buffer == null, typeof(RentBuffer));
+
+				return Buffer.Length;
+			}
+		}
 
 		public readonly Span<byte> Span
 		{
@@ -30,6 +51,7 @@ namespace FaGe.Kcp.Utility
 				return Buffer.AsMemory();
 			}
 		}
+
 		public void Dispose()
 		{
 			if (Buffer == null)
@@ -46,6 +68,9 @@ namespace FaGe.Kcp.Utility
 			if (Buffer.Length < newSize)
 			{
 				var buffer = source.Rent(newSize);
+			if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+				KcpTraceEventSource.Log.KcpBufferWasRent(Buffer.Length, newSize, buffer.Length);
+
 				Buffer.AsSpan().CopyTo(buffer.AsSpan());
 				Dispose();
 				Buffer = buffer;

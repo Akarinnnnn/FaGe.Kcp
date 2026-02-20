@@ -1,4 +1,5 @@
-﻿using FaGe.Kcp.Utility;
+﻿using FaGe.Kcp.Tracing;
+using FaGe.Kcp.Utility;
 using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -119,6 +120,9 @@ namespace FaGe.Kcp
 
 		public void RentBufferFromPool(int sizeHint)
 		{
+			if (KcpTraceEventSource.Log.IsVerboseEnabled(KcpTraceEventSource.KcpEventKeywords.Internal))
+				KcpTraceEventSource.Log.KcpPacketBufferWantBuffer(HeaderRef.conv, sizeHint);
+
 			rentBuffer.EnsureCapacity(sizeHint);
 		}
 
@@ -128,7 +132,7 @@ namespace FaGe.Kcp
 		/// <param name="count"></param>
 		public void Advance(uint count)
 		{
-			Debug.Assert(PayloadMemory.Length <= Length + count);
+			Debug.Assert(count <= int.MaxValue, "单次推进的字节数不能超过int.MaxValue");
 			Advance((int)count);
 		}
 
@@ -170,7 +174,7 @@ namespace FaGe.Kcp
 		{
 			PacketBuffer result = new(bufferSource, packetBuffer.Length, false);
 
-			if (result.rentBuffer.Buffer!.Length < packetBuffer.Length)
+			if (result.rentBuffer.Capacity < packetBuffer.Length)
 				result.rentBuffer.EnsureCapacity(packetBuffer.Length);
 
 			packetBuffer.CopyTo(result.RentBuffer);
@@ -216,7 +220,7 @@ namespace FaGe.Kcp
 		internal struct FlushPacketBuffer : IDisposable
 		{
 			private PacketBuffer? packetBuffer;
-			private int bufferSizeLimit;
+			internal int BufferSizeLimit { get; private set; }
 
 			internal FlushPacketBuffer(ArrayPool<byte> bufferSource, int expectedCapacity)
 			{
@@ -239,7 +243,7 @@ namespace FaGe.Kcp
 			{
 				CheckDisposed();
 				packetBuffer.RentBufferFromPool(size);
-				bufferSizeLimit = size;
+				BufferSizeLimit = size;
 			}
 
 			public Memory<byte> EncodedPacketsMemory
@@ -269,7 +273,7 @@ namespace FaGe.Kcp
 			public bool TryWriteHeaderOnlyPacket(KcpPacketHeaderAnyEndian headerOnlyPacket)
 			{
 				CheckDisposed();
-				if (packetBuffer.PayloadMemory.Length + KcpPacketHeaderAnyEndian.ExpectedSize > bufferSizeLimit)
+				if (packetBuffer.PayloadMemory.Length + KcpPacketHeaderAnyEndian.ExpectedSize > BufferSizeLimit)
 					return false;
 
 				var encodingSpan = packetBuffer.RemainingMemory.Span;
@@ -285,7 +289,7 @@ namespace FaGe.Kcp
 			{
 				CheckDisposed();
 				var encodingSpan = packetBuffer.RemainingMemory.Span;
-				if (packetBuffer.PayloadMemory.Length + sourcePacket.PacketMemory.Length > bufferSizeLimit)
+				if (packetBuffer.PayloadMemory.Length + sourcePacket.PacketMemory.Length > BufferSizeLimit)
 					return false;
 
 				bool succeed = sourcePacket.Encode(ref encodingSpan, out int encodedLength) == OperationStatus.Done;
